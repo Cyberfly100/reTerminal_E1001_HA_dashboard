@@ -1,0 +1,22 @@
+# Never commit real secrets — secrets.yaml.sample is the
+# tracked template (API key + WiFi credentials)
+secrets.yaml
+
+# ESPHome build output when compiling in place
+.esphome/
+build/
+
+# Compiled firmware images anywhere in the tree
+*.bin
+*.elf
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local Python environments if esphome is run from here
+.venv/
+__pycache__/

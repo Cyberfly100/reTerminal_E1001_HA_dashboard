@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    name: ESPHome ${{ matrix.esphome }} — ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned minimum supported version + latest
+        # (latest is what catches regressions like the
+        # 2026.10.0 data_template bug, esphome#21303)
+        esphome: ["2026.4.5", "latest"]
+        variant: ["standard", "demo"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.esphome
+            ~/.platformio
+          key: esphome-${{ matrix.esphome }}-${{ runner.os }}
+
+      - name: Install ESPHome
+        run: |
+          if [ "${{ matrix.esphome }}" = "latest" ]; then
+            pip install esphome
+          else
+            pip install "esphome==${{ matrix.esphome }}"
+          fi
+
+      - name: Prepare secrets
+        run: cp secrets.yaml.sample secrets.yaml
+
+      - name: Prepare demo variant
+        if: matrix.variant == 'demo'
+        run: >-
+          sed -i "s/demo_mode: 'false'/demo_mode: 'true'/"
+          reterminal-e1001-entrance.yaml
+
+      - name: Compile
+        run: esphome compile reterminal-e1001-entrance.yaml
