@@ -112,6 +112,14 @@ struct ForecastSlot {
   // carried no such field
   float humidity;
   float wind_speed;
+  // Hours ahead of the fetch time this slot's forecast
+  // is for. Emitted by the fetch template itself (an
+  // "hours_ahead" field next to the provider data), so
+  // the strip can select a slot grid by offset — the
+  // split layout shows the 3-hour grid, the wide
+  // no-calendar layout the 2-hour one, both from the
+  // same union fetch. -1 while unset
+  int hours_ahead = -1;
 };
 
 // Forecast slots, filled by fetch_hourly_forecast in the
@@ -359,51 +367,70 @@ inline int draw_current_weather(
   // pushes are not tied to the refresh cycle and can
   // lag behind the first fetch-based redraws after
   // boot; the fetched slot fills the whole panel
-  // from the very first successful refresh instead
+  // from the very first successful refresh instead.
+  //
+  // Demo mode: the canned slot 0 IS the current values —
+  // the live attributes are ignored, so no real data
+  // leaks into the demo layout when HA happens to be
+  // connected, and demo_missing blanks the current
+  // rows like any other field
   // ------------------------------------------------
 
   const bool have_slots = !forecast_slots.empty();
 
+  const ForecastSlot *const slot0 =
+      have_slots ? &forecast_slots.front() : nullptr;
+
+  const bool demo = id(demo_mode_enabled);
+
   const float current_temperature =
-      !isnan(id(met_temperature).state)
-          ? id(met_temperature).state
-          : (have_slots
-                 ? forecast_slots.front().temperature
-                 : NAN);
+      demo
+          ? (slot0 ? slot0->temperature : NAN)
+          : (!isnan(id(met_temperature).state)
+                 ? id(met_temperature).state
+                 : (slot0 ? slot0->temperature : NAN));
 
   const float current_humidity =
-      !isnan(id(met_humidity).state)
-          ? id(met_humidity).state
-          : (have_slots
-                 ? forecast_slots.front().humidity
-                 : NAN);
+      demo
+          ? (slot0 ? slot0->humidity : NAN)
+          : (!isnan(id(met_humidity).state)
+                 ? id(met_humidity).state
+                 : (slot0 ? slot0->humidity : NAN));
 
   const float current_wind =
-      !isnan(id(met_wind_speed).state)
-          ? id(met_wind_speed).state
-          : (have_slots
-                 ? forecast_slots.front().wind_speed
-                 : NAN);
+      demo
+          ? (slot0 ? slot0->wind_speed : NAN)
+          : (!isnan(id(met_wind_speed).state)
+                 ? id(met_wind_speed).state
+                 : (slot0 ? slot0->wind_speed : NAN));
 
   const std::string current_condition =
-      !id(met_condition).state.empty()
-          ? id(met_condition).state
-          : (have_slots
-                 ? forecast_slots.front().condition
-                 : "");
+      demo
+          ? (slot0 ? slot0->condition : "")
+          : (!id(met_condition).state.empty()
+                 ? id(met_condition).state
+                 : (slot0 ? slot0->condition : ""));
 
   const float current_feels_like =
-      !isnan(id(met_feels_like).state)
-          ? id(met_feels_like).state
-          : feels_like_entity(
+      demo
+          ? feels_like_entity(
                 current_temperature,
                 current_humidity,
                 isnan(current_wind)
                     ? NAN
-                    : current_wind * wind_unit_factor());
+                    : current_wind * wind_unit_factor())
+          : (!isnan(id(met_feels_like).state)
+                 ? id(met_feels_like).state
+                 : feels_like_entity(
+                       current_temperature,
+                       current_humidity,
+                       isnan(current_wind)
+                           ? NAN
+                           : current_wind * wind_unit_factor()));
 
   // Display unit for wind: the entity's unit, or the
-  // metric default before it has arrived
+  // metric default before it has arrived (the demo data
+  // is in km/h, matching the default)
   const std::string wind_unit =
       id(met_wind_speed_unit).state.empty()
           ? "km/h"
@@ -961,11 +988,25 @@ inline int draw_current_weather(
 // Hourly forecast (anchored to the given bottom y)
 // ==================================================
 
+// The two strip grids, both drawn from the same union
+// fetch (the layout switch is runtime — a quiet week
+// releases the calendar half — so the firmware gathers
+// the slots either grid may need and selects by offset
+// at draw time): the split column keeps four 3-hour
+// slots, the wide no-calendar layout doubles to eight
+// 2-hour slots covering a ~16 h awake window
+constexpr int STRIP_GRID_COLUMN[] = {0, 3, 6, 9};
+constexpr int STRIP_GRID_COLUMN_COUNT = 4;
+constexpr int STRIP_GRID_FULL[] = {0, 2, 4, 6, 8, 10, 12, 14};
+constexpr int STRIP_GRID_FULL_COUNT = 8;
+
 inline void draw_hourly_forecast(
     display::Display &it,
     int x,
     int bottom_y,
-    int width
+    int width,
+    const int *hours_ahead,
+    int hours_ahead_count
 ) {
   constexpr int ROW_GAP = 4;
 
@@ -973,6 +1014,25 @@ inline void draw_hourly_forecast(
       forecast_slots;
 
   if (slots.empty()) {
+    return;
+  }
+
+  // The slots this grid shows, selected by hour offset
+  // in the grid's order. A slot the fetch never
+  // returned (a provider serving a shorter forecast) is
+  // skipped, leaving fewer, wider columns
+  std::vector<const ForecastSlot *> shown;
+
+  for (int k = 0; k < hours_ahead_count; k++) {
+    for (const ForecastSlot &slot : slots) {
+      if (slot.hours_ahead == hours_ahead[k]) {
+        shown.push_back(&slot);
+        break;
+      }
+    }
+  }
+
+  if (shown.empty()) {
     return;
   }
 
@@ -1029,15 +1089,17 @@ inline void draw_hourly_forecast(
   // (auto-hide mode) when no slot serves the field.
   // All slots share one row grid, so the decision is
   // made for the whole strip: a lone missing value
-  // keeps the row with a placeholder for that slot
+  // keeps the row with a placeholder for that slot.
+  // Only the slots this grid shows count, not the
+  // whole union fetch
   const bool show_precipitation =
       !hide_missing_fields() ||
       std::any_of(
-          slots.begin(),
-          slots.end(),
-          [](const ForecastSlot &slot) {
+          shown.begin(),
+          shown.end(),
+          [](const ForecastSlot *slot) {
             return !isnan(
-                slot.precipitation_probability
+                slot->precipitation_probability
             );
           }
       );
@@ -1059,10 +1121,10 @@ inline void draw_hourly_forecast(
       temperature_y + temperature_size.height + ROW_GAP;
 
   const int column_width =
-      width / static_cast<int>(slots.size());
+      width / static_cast<int>(shown.size());
 
-  for (size_t i = 0; i < slots.size(); i++) {
-    const ForecastSlot &slot = slots[i];
+  for (size_t i = 0; i < shown.size(); i++) {
+    const ForecastSlot &slot = *shown[i];
 
     const int center_x =
         x + static_cast<int>(i) * column_width +

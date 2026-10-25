@@ -33,12 +33,24 @@ substitutions:
   # (see docs/testing.md)
   demo_mode: 'false'
 
+  # Demo mode only: the header status text (instead of
+  # the Home Assistant entity / the "all systems
+  # nominal" fallback), and a comma-separated list of
+  # demo fields to blank — the dynamic layout (hidden
+  # rows with hide_missing, placeholders otherwise) can
+  # then be tested without any HA wiring. Field names:
+  # uv, humidity, wind, low, high, uvmax, precipitation,
+  # calendars (the last one empties the calendar panel,
+  # switching the layout to full-width weather)
+  demo_status: 'Demo mode — canned data'
+  demo_missing: ''
+
   # Battery saver (see docs/battery-saver-plan.md):
   # deep sleep between refreshes while on battery.
   # Sleep duration, awake window after a timer wake,
   # and interactive window after a button wake, all
   # in seconds
-  battery_saver: 'false'
+  battery_saver: 'true'
   battery_sleep_seconds: '900'
   battery_awake_seconds: '30'
   battery_button_awake_seconds: '120'
@@ -116,18 +128,27 @@ esp32:
     type: esp-idf
 
 logger:
+  # The E1001's USB-C goes through a USB-to-UART bridge
+  # on UART0 (GPIO43/44) — NOT the ESP32-S3's native
+  # USB_SERIAL_JTAG, whose fixed pins (GPIO19/20) this
+  # board uses as the sensor I2C bus (SHT4x + PCF8563).
+  # The S3 default (USB_SERIAL_JTAG) muxes the log
+  # output onto the I2C pins and leaves the USB port
+  # silent; UART0 puts the logs on the bridge
+  hardware_uart: UART0
 
 api:
   encryption:
     key: !secret reterminal_e1001_entrance__encryption_key
-  # Replay buttons that woke the device from deep
-  # sleep to Home Assistant, so the automations on
-  # the button entities still trigger — the press
-  # happened while the SoC was asleep (a no-op
-  # whenever the wake was not button-caused)
-  on_client_connected:
-    then:
-      - lambda: 'wake_button_replay();'
+  # The wake-button replay used to run here, at the
+  # first client's authentication — but that raced the
+  # client's state subscription (a 500 ms pulse could
+  # finish before HA subscribed, so HA never saw the
+  # on edge and the button automations never fired).
+  # It now runs from the 5 s battery saver tick,
+  # gated on Home Assistant having pushed entity
+  # states — only subscribers receive those — see
+  # battery_saver_tick() in sleep_helpers.h
 ota:
   - platform: esphome
 
@@ -162,10 +183,33 @@ light:
     # Setting transition length to 0s makes the buzzer turn on and off instantly.
     default_transition_length: 0s
 
+# Momentary button signals for Home Assistant: one
+# event entity, one type per button. Stateless by
+# design — no on/off pair, no stuck entity, and nothing
+# for the api's deferred, state-deduplicated sends to
+# collapse (the failure mode of the earlier binary-
+# sensor pulse). Automations use HA's "Event received"
+# trigger with the type as the option; the entity's
+# state is the timestamp of the last event, so the
+# press remains visible even after the device sleeps.
+# The buttons themselves are internal binary sensors
+# (see below) — their presses fire the matching type
+# here, whether natural or replayed from a sleep wake
+event:
+  - platform: template
+    name: "E1001 Buttons"
+    id: e1001_buttons
+    device_class: button
+    event_types:
+      - green
+      - middle
+      - left
+
 binary_sensor:
   # Green button - refresh display
   - platform: gpio
     id: button_green
+    internal: true
     pin:
       number: GPIO3
       mode: INPUT_PULLUP
@@ -176,11 +220,14 @@ binary_sensor:
         # Someone is interacting: extend the awake
         # window while the battery saver governs
         - lambda: 'extend_awake_window();'
+        - event.trigger:
+            id: e1001_buttons
+            event_type: green
 
   # Middle white button
   - platform: gpio
     id: button_middle
-    name: "E1001 Middle Button"
+    internal: true
     pin:
       number: GPIO4
       mode: INPUT_PULLUP
@@ -188,11 +235,14 @@ binary_sensor:
     on_press:
       then:
         - lambda: 'extend_awake_window();'
+        - event.trigger:
+            id: e1001_buttons
+            event_type: middle
 
   # Left white button
   - platform: gpio
     id: button_left
-    name: "E1001 Left Button"
+    internal: true
     pin:
       number: GPIO5
       mode: INPUT_PULLUP
@@ -200,11 +250,16 @@ binary_sensor:
     on_press:
       then:
         - lambda: 'extend_awake_window();'
+        - event.trigger:
+            id: e1001_buttons
+            event_type: left
 
   # Input source present (read from the SY6974B
   # charger on the I2C bus, refreshed every 5 s by
-  # the battery saver tick); unknown counts as
-  # present — the fail-safe direction
+  # the battery saver tick); silence on both buses
+  # leaves the pack voltage to decide, and the brief
+  # window before the first read counts as present —
+  # the fail-safe direction
   - platform: template
     name: "External Power"
     id: external_power
@@ -309,6 +364,26 @@ globals:
     type: bool
     restore_value: false
     initial_value: 'false'
+
+  # Demo mode as a runtime flag for the helper headers
+  # (substitutions only expand inside the YAML text, so
+  # the headers read this global instead — the display's
+  # current-weather values use it to prefer the canned
+  # slot 0 over live attributes, keeping demo mode fully
+  # canned even when HA happens to be connected, and
+  # letting demo_missing blank the current rows)
+  - id: demo_mode_enabled
+    type: bool
+    restore_value: false
+    initial_value: '${demo_mode}'
+
+  # The demo_missing field list for the same reason:
+  # demo_helpers.h reads this global (an empty string
+  # means nothing is missing)
+  - id: demo_missing_list
+    type: std::string
+    restore_value: false
+    initial_value: '"${demo_missing}"'
 
   # Calendar fetch window, precomputed once per
   # refresh in refresh_dashboard; the data_template
@@ -440,6 +515,19 @@ sensor:
     on_value:
       then:
         - component.update: met_feels_like
+        # Replay a wake button press shortly after Home
+        # Assistant's states arrive. NOT inline here:
+        # this automation runs inside the api message
+        # handler for the state push, BEFORE Home
+        # Assistant's device-entity subscription is
+        # processed — anything published at that moment
+        # has no subscriber and is silently dropped
+        # (observed: the entire pulse swallowed; HA
+        # logged only the subscription burst's final
+        # state). The pulse is scheduled ~750 ms out,
+        # past the message backlog — see
+        # defer_wake_button_replay()
+        - lambda: 'defer_wake_button_replay();'
         - if:
             condition:
               and:
@@ -527,24 +615,47 @@ sensor:
       return id(battery_voltage).state;
     update_interval: 60s
     filters:
+      # method: exact is required: calibrate_linear
+      # defaults to least_squares, which collapses the
+      # table into one straight line — that line reads
+      # above 100 % for anything over ~4.08 V, so the
+      # clamp pins the level to 100 % across the whole
+      # top of the range and the battery row (hidden at
+      # 100 %) never appears. exact interpolates the
+      # table segment by segment instead
       - calibrate_linear:
-          - 4.15 -> 100.0
-          - 3.96 -> 90.0
-          - 3.91 -> 80.0
-          - 3.85 -> 70.0
-          - 3.80 -> 60.0
-          - 3.75 -> 50.0
-          - 3.68 -> 40.0
-          - 3.58 -> 30.0
-          - 3.49 -> 20.0
-          - 3.41 -> 10.0
-          - 3.30 -> 5.0
-          - 3.27 -> 0.0
+          method: exact
+          # ascending — the exact method requires it
+          datapoints:
+            - 3.27 -> 0.0
+            - 3.30 -> 5.0
+            - 3.41 -> 10.0
+            - 3.49 -> 20.0
+            - 3.58 -> 30.0
+            - 3.68 -> 40.0
+            - 3.75 -> 50.0
+            - 3.80 -> 60.0
+            - 3.85 -> 70.0
+            - 3.91 -> 80.0
+            - 3.96 -> 90.0
+            - 4.15 -> 100.0
       - clamp:
           min_value: 0
           max_value: 100
 
 text_sensor:
+  # Wake diagnostics: how the current session woke
+  # (button mask / refresh timer / reset reason). The
+  # boot-moment log line fires before any API client
+  # can attach, so this sensor is the reliable way to
+  # read it after the fact — e.g. after a button-wake
+  # test of the replay
+  - platform: template
+    name: "E1001 Wake Info"
+    id: wake_info_sensor
+    lambda: 'return std::string(wake_info);'
+    update_interval: 60s
+
   - platform: homeassistant
     id: met_condition
     entity_id: ${weather_entity}
@@ -702,11 +813,24 @@ script:
 
           capture_response: true
 
+          # The union of the two strip grids, ascending:
+          # 0/3/6/9 (3-hour, the split column) and
+          # 0/2/4/…/14 (2-hour, the wide no-calendar
+          # layout). The layout switch is runtime — a
+          # quiet week releases the calendar half — so
+          # either grid may be needed after any fetch;
+          # each entry is tagged with its hour offset and
+          # the strip selects its grid by that tag at
+          # draw time. The length guard skips offsets a
+          # shorter provider forecast does not carry
+          # instead of failing the whole template
           response_template: >
             {
               "forecast": [
-                {% for i in [0, 3, 6, 9] %}
+                {% for i in [0, 2, 3, 4, 6, 8, 9, 10, 12, 14]
+                   if response['${weather_entity}']['forecast'] | length > i %}
                 {
+                  "hours_ahead": {{ i }},
                   "time": "{{ as_timestamp(response['${weather_entity}']['forecast'][i]['datetime']) | timestamp_custom('%H:%M') }}",
                   "condition": "{{ response['${weather_entity}']['forecast'][i]['condition'] }}",
                   "temperature": {{ response['${weather_entity}']['forecast'][i]['temperature'] | float }},
@@ -743,6 +867,12 @@ script:
                       item["humidity"].as<float>();
                   slot.wind_speed =
                       item["wind_speed"].as<float>();
+
+                  // The fetch template's own offset tag,
+                  // not provider data — see the template
+                  // comment above
+                  slot.hours_ahead =
+                      item["hours_ahead"].as<int>();
 
                   // -1 sentinels: the entry carried no
                   // such field
@@ -1091,10 +1221,13 @@ display:
       );
 
       // Status text from Home Assistant, or the
-      // default if no state has arrived yet
+      // default if no state has arrived yet; demo mode
+      // shows its canned status instead (substitution)
       std::string status_text = "all systems nominal";
 
-      if (
+      if (${demo_mode}) {
+        status_text = "${demo_status}";
+      } else if (
           id(dashboard_status).has_state() &&
           !id(dashboard_status).state.empty()
       ) {
@@ -1170,26 +1303,51 @@ display:
 
 
       // --------------------------------------------------
-      // Weather panel; without any enabled calendar
-      // it takes a wider, centered box and the hourly
-      // strip the full content width
+      // Weather panel; the left column beside the
+      // calendar, or — when a refresh cycle produced no
+      // calendar content (all disabled, a quiet week, or
+      // the demo gap list naming calendars) — the full
+      // content width, aligned with the header box. The
+      // switch is runtime: every dashboard draw follows
+      // a completed fetch cycle or its watchdog, so an
+      // empty list at draw time is always a settled
+      // result, never a mid-fetch state. In the wide
+      // layout the current-weather group keeps a
+      // centered ~55% content width inside the box (its
+      // layout is right-anchored and would otherwise
+      // hug the screen edge), while the boundary and the
+      // hourly strip use the whole width — the strip's
+      // eight 2-hour slots instead of the four 3-hour
+      // ones that fit the column
       // --------------------------------------------------
 
       const bool show_calendar =
-          ${calendar_1_enabled} ||
-          ${calendar_2_enabled} ||
-          ${calendar_3_enabled} ||
-          ${calendar_4_enabled};
+          (${calendar_1_enabled} ||
+           ${calendar_2_enabled} ||
+           ${calendar_3_enabled} ||
+           ${calendar_4_enabled}) &&
+          !calendar_events.empty();
 
       const int weather_width =
           show_calendar
               ? COLUMN_WIDTH
+              : W - 2 * MARGIN;
+
+      // Both layouts anchor at the left margin
+      const int weather_x = LEFT_X;
+
+      const int current_weather_width =
+          show_calendar
+              ? weather_width
               : W * 55 / 100;
 
-      const int weather_x =
+      const int current_weather_x =
           show_calendar
-              ? LEFT_X
-              : (W - weather_width) / 2;
+              ? weather_x
+              : weather_x +
+                    (weather_width -
+                     current_weather_width) /
+                        2;
 
       rounded_rectangle(
           it,
@@ -1202,18 +1360,24 @@ display:
 
       draw_current_weather(
           it,
-          weather_x,
+          current_weather_x,
           CONTENT_Y,
-          weather_width
+          current_weather_width
       );
 
       constexpr int BOTTOM_INSET = 20;
 
       draw_hourly_forecast(
           it,
-          show_calendar ? LEFT_X : MARGIN,
+          weather_x,
           CONTENT_Y + CONTENT_HEIGHT - BOTTOM_INSET,
-          show_calendar ? COLUMN_WIDTH : W - 2 * MARGIN
+          weather_width,
+          show_calendar
+              ? STRIP_GRID_COLUMN
+              : STRIP_GRID_FULL,
+          show_calendar
+              ? STRIP_GRID_COLUMN_COUNT
+              : STRIP_GRID_FULL_COUNT
       );
 
 

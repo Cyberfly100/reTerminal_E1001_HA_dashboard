@@ -31,12 +31,14 @@ Zephyr board support files.
 - **Button actions are HA automations (Q4 detail)** — a press during
   sleep happens while the SoC is off, so no `on_press` fires. The
   firmware reads the wake mask (`esp_deep_sleep_get_gpio_wakeup_status()`)
-  at boot and **replays** the button event to HA after the API
-  connects: `publish_state(true)` on the button's binary sensor; the
-  GPIO loop then publishes the released state, so HA sees the
-  on→off edge and the automation triggers. If the button is still
-  held at connect, the natural `on_press` has already fired and the
-  replay is a no-op (same state) — no double triggers.
+  at boot and **replays** the press to HA after its states arrive:
+  one event-entity trigger (`id(e1001_buttons).trigger("middle")`)
+  per pressed button — stateless, fire-and-forget, no on/off
+  ordering. (The original design replayed a binary-sensor on→off
+  pulse; the api's deferred, state-deduplicated sends collapsed
+  any on→off pair published within one loop pass into a single
+  "off" message, so HA never saw the press. Events sidestep the
+  entire mechanism — see the README battery-saver notes.)
 - **Green button** — its local function (refresh) runs via the
   normal boot refresh after any wake; no special casing needed.
 - **Awake window (Q2: 30 s)** — armed once the clock syncs after a
@@ -68,8 +70,9 @@ Zephyr board support files.
   enable) is turned off explicitly, so it cannot drain during sleep;
   verified further by a current measurement (below).
 
-Substitutions: `battery_saver` (default `'false'`),
-`battery_sleep_seconds` (`'900'`), `battery_awake_seconds` (`'30'`),
+Substitutions: `battery_saver` (default `'true'` — on external
+power the saver stays completely inert), `battery_sleep_seconds`
+(`'900'`), `battery_awake_seconds` (`'30'`),
 `battery_button_awake_seconds` (`'120'`).
 
 ## Known constraints (unchanged from draft)
@@ -126,11 +129,18 @@ the ≥30 s margins around it are comfortable.
 
 ## Implementation files (done)
 
-- `battery_helpers.h` — charger read + cached state +
-  `external_power_present()` (fail-safe semantics)
-- `sleep_helpers.h` (new) — wake-cause read (EXT1 mask), button
-  replay, awake-window deadline, `battery_saver_tick()` (on the
-  existing 5 s interval), `enter_battery_sleep()`
+- `battery_helpers.h` — charger read (answered → BUS_GD;
+  silent on both buses → pack-voltage tie-break, NACK and
+  bus errors deliberately merged — the ESP32-S3 does not
+  report them reliably) + cached state with transition
+  logging + `external_power_present()` (undetermined
+  counts as present — fail-safe)
+- `sleep_helpers.h` (new) — wake-cause read (EXT1 mask,
+  timer and reset causes logged too), button replay,
+  awake-window deadline, `battery_saver_tick()` (on the
+  existing 5 s interval, one-shot status log at the
+  first tick), `enter_battery_sleep()` (log line flushed
+  to connected clients before the shutdown)
 - YAML — substitutions, globals, `i2c:` charger bus, External Power
   binary sensor, boot hatch + wake-cause read, `api:
   on_client_connected` replay, button window extension, bridge off

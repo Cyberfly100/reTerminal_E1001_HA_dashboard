@@ -60,8 +60,11 @@ precipitation, humidity`
 
 ## 3. `weather.get_forecasts` — type: hourly
 
-Used by the dashboard for the 4 hourly forecast slots (+0/+3/+6/+9 h)
-**and the current UV index** (slot 0 is the current hour). Fields per entry:
+Used by the dashboard for the hourly strip — the union of its two slot grids (the
+split layout's four 3-hour slots +0/+3/+6/+9 h and the wide no-calendar layout's
+eight 2-hour slots +0/+2/…/+14 h, roughly a 16 h window; each fetched entry is
+tagged with its hour offset and the strip selects its grid by that tag at draw
+time) — **and the current UV index** (offset 0 is the current hour). Fields per entry:
 
 `condition, precipitation_probability, datetime, cloud_coverage,
 uv_index ✅, temperature, wind_gust_speed, wind_speed, precipitation, humidity`
@@ -73,8 +76,8 @@ uv_index ✅, temperature, wind_gust_speed, wind_speed, precipitation, humidity`
   in C++, distinct from a genuine `0` % chance) — with
   `hide_missing: 'true'` the row is hidden while no slot serves it.
 - Entries are "next N hours from now" (not "today"), and `datetime` is UTC.
-- Pre-existing quirk (unrelated to UV): at night the four display slots are
-  all night hours.
+- Pre-existing quirk (unrelated to UV): fetched at night, the display slots are
+  all night hours (four in the split layout, eight in the wide one).
 
 ## Consequence for the dashboard
 

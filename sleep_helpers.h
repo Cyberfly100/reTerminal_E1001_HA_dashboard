@@ -5,6 +5,7 @@
 
 #include <driver/gpio.h>
 #include <esp_sleep.h>
+#include <esp_ota_ops.h>
 
 
 // ==================================================
@@ -35,11 +36,44 @@ inline uint8_t wake_button_mask = 0;
 // to the whole period)
 inline bool wake_was_button = false;
 
+// Wake diagnostics, persisted for the whole session and
+// re-logged at the first tick: the boot-moment log line
+// fires at setup priority 600, before any API client can
+// attach, so it is network-invisible by construction. It
+// is also exposed to HA via the "E1001 Wake Info" template
+// text sensor — the reliable post-hoc channel (the USB
+// bridge cannot carry the app log on this framework
+// version; see the README hardware notes)
+inline char wake_info[64] = "reset (unknown reason)";
+
 inline void wake_cause_read() {
-  if (
-      esp_sleep_get_wakeup_cause() !=
-      ESP_SLEEP_WAKEUP_EXT1
-  ) {
+  const esp_sleep_wakeup_cause_t cause =
+      esp_sleep_get_wakeup_cause();
+
+  if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+    ESP_LOGI("sleep", "Woken by the refresh timer");
+    snprintf(wake_info, sizeof(wake_info), "refresh timer");
+    return;
+  }
+
+  if (cause != ESP_SLEEP_WAKEUP_EXT1) {
+    const char *reason = "other";
+    switch (esp_reset_reason()) {
+      case ESP_RST_POWERON:   reason = "power-on"; break;
+      case ESP_RST_SW:       reason = "software (OTA/esp_restart)"; break;
+      case ESP_RST_PANIC:    reason = "panic/crash"; break;
+      case ESP_RST_INT_WDT:  reason = "interrupt watchdog"; break;
+      case ESP_RST_TASK_WDT: reason = "task watchdog"; break;
+      case ESP_RST_BROWNOUT: reason = "brownout"; break;
+      case ESP_RST_DEEPSLEEP: reason = "deep sleep (unexpected path)"; break;
+      default: break;
+    }
+
+    ESP_LOGI("sleep", "Woken by reset (%s)", reason);
+    snprintf(
+        wake_info, sizeof(wake_info),
+        "reset (%s)", reason
+    );
     return;
   }
 
@@ -58,6 +92,10 @@ inline void wake_cause_read() {
       "sleep",
       "Woken by button press, mask %d",
       wake_button_mask
+  );
+  snprintf(
+      wake_info, sizeof(wake_info),
+      "button mask %d", wake_button_mask
   );
 }
 
@@ -85,6 +123,11 @@ inline void arm_awake_window(int seconds) {
   if (now.is_valid()) {
     battery_sleep_deadline =
         static_cast<int>(now.timestamp) + seconds;
+    // Visible in the logs: the connect ceiling at boot,
+    // the real window at the anchor, and every button
+    // press extending it — the sleep timing can be
+    // attributed from the log alone
+    ESP_LOGI("sleep", "Awake window armed for %d s", seconds);
   }
 }
 
@@ -124,27 +167,86 @@ inline void arm_awake_window_for_wake() {
   }
 }
 
-// Replay buttons pressed during sleep to Home
-// Assistant: the automation listening on the button
-// entity sees the on edge here and the off edge once
-// the GPIO loop reports the released state. If the
-// button is still held, the natural on_press already
-// fired and the extra publish is a same-state no-op
+// Deferred wake-button replay. The state pushes that
+// trigger the anchor arrive as api messages BEFORE
+// Home Assistant's device-entity subscription is
+// processed — the connection does not accept entity
+// sends yet, and everything published from inside that
+// message handler is silently dropped (observed: the
+// whole pulse swallowed, and HA's subscription burst
+// afterwards delivered only the final state —
+// unavailable -> off). The anchor therefore stamps an
+// earliest-replay deadline, and the 5 s tick delivers
+// the pulse once it passes (see battery_saver_tick):
+// the tick context is outside any api message handler,
+// past the message backlog, and if the fetch cycle's
+// e-ink redraw is blocking the loop the queued sends
+// flush right after it
+constexpr int WAKE_REPLAY_DEFER_SECONDS = 2;
+
+inline int wake_replay_deadline = 0;
+
+inline void defer_wake_button_replay() {
+  if (
+      wake_button_mask == 0 ||
+      wake_replay_deadline != 0
+  ) {
+    return;
+  }
+
+  const auto now = id(home_time).now();
+
+  if (!now.is_valid()) {
+    return;
+  }
+
+  wake_replay_deadline =
+      static_cast<int>(now.timestamp) +
+      WAKE_REPLAY_DEFER_SECONDS;
+
+  ESP_LOGI(
+      "sleep",
+      "Wake button press pending replay, mask %d",
+      wake_button_mask
+  );
+}
+
+// Replay buttons pressed during sleep to Home Assistant
+// as event-entity types: one fire-and-forget message per
+// press — no state, no pulse, no on/off ordering, and
+// therefore immune to the api's deferred, state-
+// deduplicated sends (a binary-sensor on→off pair
+// published within one loop pass collapses into a
+// single off message — the failure mode that cost a
+// day of debugging). Delivered from the tick via the
+// deadline in defer_wake_button_replay(); presses
+// replay even when HA was unreachable at the wake, and
+// the natural awake presses fire the same types from
+// the buttons' on_press (the YAML). Edge case: types
+// triggered within one un-flushed pass are deduplicated
+// to the last, so two buttons pressed during the SAME
+// sleep deliver one event — vanishingly rare
 inline void wake_button_replay() {
   if (wake_button_mask == 0) {
     return;
   }
 
+  ESP_LOGI(
+      "sleep",
+      "Replaying button press(es) to HA, mask %d",
+      wake_button_mask
+  );
+
   if (wake_button_mask & (1 << 0)) {
-    id(button_green).publish_state(true);
+    id(e1001_buttons).trigger("green");
   }
 
   if (wake_button_mask & (1 << 1)) {
-    id(button_middle).publish_state(true);
+    id(e1001_buttons).trigger("middle");
   }
 
   if (wake_button_mask & (1 << 2)) {
-    id(button_left).publish_state(true);
+    id(e1001_buttons).trigger("left");
   }
 
   // One shot: a later reconnect must not replay again
@@ -161,6 +263,24 @@ inline void enter_battery_sleep() {
       "Entering deep sleep for %d s",
       id(battery_sleep_seconds)
   );
+
+  // An OTA-updated app must confirm itself before any
+  // reset, or the bootloader rolls the update back at
+  // the next boot. Observed: a fresh OTA app whose
+  // first awake window expired ~36 s after boot —
+  // before the 60 s safe-mode mark — rolled back at the
+  // button wake, and the OLD firmware answered the
+  // press. Reaching a deliberate deep sleep is the
+  // strongest health signal there is: mark the running
+  // app valid first (a no-op when no update is pending)
+  esp_ota_mark_app_valid_cancel_rollback();
+
+  // The API log sender queues messages; give it a
+  // moment to actually deliver the line before the
+  // shutdown tears the connection down — otherwise
+  // the device can disappear without a trace in the
+  // logs
+  delay(250);
 
   // The battery measurement divider must not drain
   // during sleep
@@ -209,8 +329,61 @@ inline int invalid_clock_ticks = 0;
 // the clock has synced after the wake, and enter deep
 // sleep once the deadline passed with no fetch
 // outstanding
+//
+// The very first tick of each boot also logs *why*
+// the saver is or is not governing — every sleep/no-
+// sleep decision must be attributable from the logs
+// alone
+inline bool saver_status_logged = false;
+
+inline void log_saver_status() {
+  if (saver_status_logged) {
+    return;
+  }
+  saver_status_logged = true;
+
+  // Re-log the wake cause here: the boot-moment line
+  // fires before any API client can attach and is
+  // network-invisible by construction (see wake_info)
+  ESP_LOGI("sleep", "Wake cause: %s", wake_info);
+
+  if (!id(battery_saver_enabled)) {
+    ESP_LOGI("sleep", "Battery saver off (battery_saver: 'false')");
+  } else if (external_power_state == 1) {
+    ESP_LOGI("sleep", "Battery saver on, external power detected — staying awake");
+  } else if (id(sleep_hold_active)) {
+    ESP_LOGI("sleep", "Battery saver on, boot hatch holds the device awake");
+  } else if (id(sleep_hold_ha).state) {
+    ESP_LOGI("sleep", "Battery saver on, keep-awake helper holds the device awake");
+  } else {
+    ESP_LOGI(
+        "sleep",
+        "Battery saver active — on battery, pack %.2f V",
+        id(battery_voltage).state
+    );
+  }
+}
+
 inline void battery_saver_tick() {
+  // Deliver the deferred wake-button replay once past
+  // its deadline (see defer_wake_button_replay): the
+  // tick context is outside any api message handler and
+  // past Home Assistant's subscription, so the event
+  // triggers cannot be dropped
+  if (wake_replay_deadline != 0) {
+    const auto now = id(home_time).now();
+
+    if (
+        now.is_valid() &&
+        now.timestamp >= wake_replay_deadline
+    ) {
+      wake_replay_deadline = 0;
+      wake_button_replay();
+    }
+  }
+
   read_external_power();
+  log_saver_status();
 
   if (!battery_saver_active()) {
     battery_sleep_deadline = 0;

@@ -40,16 +40,21 @@ constexpr uint8_t CHARGER_BUS_GD = 0x80;
 constexpr float CHARGER_SILENT_POWERED_VOLTS = 4.15f;
 
 // Cached input-source state: 1 = external power,
-// 0 = battery, -1 = not determined (or bus error).
-// Unknown deliberately counts as powered: a flaky
-// I2C bus must never put a plugged-in device to sleep
+// 0 = battery, -1 = not determined yet (before the
+// first read). Undetermined counts as present — the
+// brief window before the first 5 s tick must not
+// put a plugged-in device to sleep
 inline int external_power_state = -1;
 
 // One charger status read attempt on a bus. Returns
-// 0 = the charger answered (powered set from BUS_GD),
-// 1 = clean NACK (nothing at the address), -1 = bus
-// error (treated as unknown)
-inline int charger_read_once(
+// true if the charger answered (powered set from
+// BUS_GD). Any non-OK result — a clean NACK (nothing
+// at the address) as well as the generic error some
+// ESP32-S3/IDF combinations report for NACKs — counts
+// as "did not answer on this bus"; distinguishing
+// them proved unreliable, so the caller falls back to
+// the pack voltage instead of a fail-safe guess
+inline bool charger_read_once(
     i2c::I2CBus &bus,
     bool &powered
 ) {
@@ -65,76 +70,77 @@ inline int charger_read_once(
           1
       );
 
-  if (error == i2c::ERROR_OK) {
-    powered = (value & CHARGER_BUS_GD) != 0;
-    return 0;
+  if (error != i2c::ERROR_OK) {
+    return false;
   }
 
-  if (error == i2c::ERROR_NOT_ACKNOWLEDGED) {
-    return 1;
+  powered = (value & CHARGER_BUS_GD) != 0;
+  return true;
+}
+
+// Update the cached input-source state, logging the
+// first determination and every transition (plug/
+// unplug, pack crossing the threshold) — the power
+// decision governs the battery saver, so it must be
+// visible in the logs, not inferred
+inline void set_external_power(
+    int state,
+    const char *basis
+) {
+  if (state == external_power_state) {
+    return;
   }
 
-  return -1;
+  ESP_LOGI(
+      "power",
+      "External power: %s (%s)",
+      state == 1 ? "connected" : "disconnected",
+      basis
+  );
+
+  external_power_state = state;
 }
 
 // Refresh the cached input-source state; call this
 // from a slow interval (5 s), not from a loop-rate
 // template lambda. Tries the charger bus first, then
 // the sensor bus (the charger might be routed there
-// on other board revisions), and interprets silence:
-// - answered → BUS_GD decides
-// - NACK everywhere → on battery (the charger's
-//   digital side appears unpowered while running
-//   unplugged), unless the pack sits at charging
-//   voltage — then assume powered
-// - bus error → unknown, fail-safe to powered
+// on other board revisions). Silence on both buses —
+// the charger's digital side is unpowered while
+// running from the battery, and some boards never
+// answer at all — leaves the pack voltage to decide:
+// charging voltage reads as powered, anything below
+// as on battery
 inline void read_external_power() {
   bool powered = false;
 
-  const int charger_bus =
-      charger_read_once(id(charger_i2c), powered);
-
-  if (charger_bus == 0) {
-    external_power_state = powered ? 1 : 0;
-    return;
-  }
-
-  const int sensor_bus =
-      charger_read_once(id(sensor_i2c), powered);
-
-  if (sensor_bus == 0) {
-    external_power_state = powered ? 1 : 0;
-    return;
-  }
-
-  if (
-      charger_bus == 1 &&
-      sensor_bus == 1
-  ) {
-    const float voltage = id(battery_voltage).state;
-
-    external_power_state =
-        (!isnan(voltage) &&
-         voltage >= CHARGER_SILENT_POWERED_VOLTS)
-            ? 1
-            : 0;
-
-    return;
-  }
-
-  static bool logged = false;
-
-  if (!logged) {
-    ESP_LOGW(
-        "power",
-        "Charger read failed; assuming "
-        "external power"
+  if (charger_read_once(id(charger_i2c), powered) ||
+      charger_read_once(id(sensor_i2c), powered)) {
+    set_external_power(
+        powered ? 1 : 0,
+        powered ? "BUS_GD set" : "BUS_GD clear"
     );
 
-    logged = true;
+    return;
   }
 
-  external_power_state = -1;
+  const float voltage = id(battery_voltage).state;
+
+  if (isnan(voltage)) {
+    // No ADC reading yet this boot; keep the previous
+    // (or undetermined) state rather than guessing
+    return;
+  }
+
+  if (voltage >= CHARGER_SILENT_POWERED_VOLTS) {
+    char basis[24];
+    snprintf(basis, sizeof(basis), "pack %.2f V", voltage);
+    set_external_power(1, basis);
+  } else {
+    char basis[24];
+    snprintf(basis, sizeof(basis), "pack %.2f V", voltage);
+    set_external_power(0, basis);
+  }
 }
 
 // True while an input source is present; unknown
