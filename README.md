@@ -1,4 +1,4 @@
-# reTerminal E1001 — E-Ink Weather & Calendar Dashboard
+# reTerminal E1001 E-Ink Weather & Calendar Dashboard
 
 An ESPHome firmware for the [Seeed reTerminal E1001](https://wiki.seeedstudio.com/reterminal_e1001/) that turns its 7.5" e-paper display into a wall dashboard for the entrance hall. All data comes from Home Assistant over the native API: weather from a `weather.*` entity, events from two calendars, and a status text from an input helper.
 
