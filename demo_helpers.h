@@ -250,6 +250,16 @@ inline void load_demo_data() {
     calendar_events.push_back(event);
   }
 
+  // The demo loader acts as one settled, successful
+  // calendar fetch cycle for the layout switch (no real
+  // fetches run in demo mode, so the counters would
+  // otherwise read "nothing ran" and pin the split
+  // layout): with "calendars" blanked, the emptiness is
+  // the settled kind and the layout flips to full-width
+  // weather — see calendar_cycle_settled()
+  calendar_fetches_dispatched = 1;
+  calendar_fetches_succeeded = 1;
+
   const auto now = id(home_time).now();
 
   if (now.is_valid()) {

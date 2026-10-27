@@ -25,6 +25,36 @@ struct CalendarEvent {
 // be used in a globals: entry.
 inline std::vector<CalendarEvent> calendar_events;
 
+// Per-cycle calendar fetch bookkeeping for the display's
+// layout switch. The refresh cycle counts how many
+// calendar fetches it dispatched and how many of those
+// succeeded (an error or a hung fetch does not count);
+// when every dispatched fetch succeeded and the event
+// list is still empty, the emptiness is a settled,
+// genuine quiet week and the layout may flip to
+// full-width weather. A failed, errored or still-in-
+// flight cycle keeps the split layout (an empty
+// calendar panel), so a transient fetch hiccup — e.g.
+// the first cycle after an OTA flash, while Home
+// Assistant is still settling — renders a sparse but
+// structurally stable frame instead of surprise-
+// removing the panel. Reset by the refresh script's
+// cycle-begin lambda, counted by the calendar fetch
+// blocks, read via calendar_cycle_settled() by the
+// display's show_calendar
+inline int calendar_fetches_dispatched = 0;
+inline int calendar_fetches_succeeded = 0;
+
+// Whether this cycle's calendar data is settled and
+// complete: at least one fetch ran, and every
+// dispatched one succeeded. A quiet week is settled; a
+// failure, a timeout or a fetch that never ran is not
+inline bool calendar_cycle_settled() {
+  return calendar_fetches_dispatched > 0 &&
+         calendar_fetches_succeeded >=
+             calendar_fetches_dispatched;
+}
+
 
 // ==================================================
 // Calendar event parsing (one merged calendar fetch)

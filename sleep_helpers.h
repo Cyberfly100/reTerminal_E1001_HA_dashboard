@@ -364,12 +364,16 @@ inline void log_saver_status() {
   }
 }
 
-inline void battery_saver_tick() {
-  // Deliver the deferred wake-button replay once past
-  // its deadline (see defer_wake_button_replay): the
-  // tick context is outside any api message handler and
-  // past Home Assistant's subscription, so the event
-  // triggers cannot be dropped
+// Fast-path delivery for the deferred wake-button
+// replay (a 500 ms interval in the YAML): the same
+// delivery as the battery-saver tick's backstop below,
+// at a finer granularity — a 5 s tick alone can leave
+// the event up to 5 s past the earliest-replay
+// deadline, which the HA automations waiting on a
+// wake press feel as sluggish. Whichever of the two
+// ticks sees the passed deadline first delivers; the
+// other no-ops on the cleared deadline
+inline void wake_replay_fast_tick() {
   if (wake_replay_deadline != 0) {
     const auto now = id(home_time).now();
 
@@ -381,6 +385,16 @@ inline void battery_saver_tick() {
       wake_button_replay();
     }
   }
+}
+
+inline void battery_saver_tick() {
+  // Deliver the deferred wake-button replay once past
+  // its deadline (see defer_wake_button_replay): the
+  // tick context is outside any api message handler and
+  // past Home Assistant's subscription, so the event
+  // triggers cannot be dropped. Usually beaten to it by
+  // the 500 ms wake_replay_fast_tick
+  wake_replay_fast_tick();
 
   read_external_power();
   log_saver_status();

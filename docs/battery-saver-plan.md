@@ -39,6 +39,12 @@ Zephyr board support files.
   any on→off pair published within one loop pass into a single
   "off" message, so HA never saw the press. Events sidestep the
   entire mechanism — see the README battery-saver notes.)
+  The replay lands ~2 s after the state pushes: deferred by ~2 s
+  (past HA's subscription burst — anything published earlier has
+  no subscriber and is dropped) and delivered by a 500 ms
+  `wake_replay_fast_tick` interval, with the 5 s battery-saver
+  tick as a backstop. Wifi joins with `fast_connect` (no scan),
+  which removes another 3-8 s between the press and HA.
 - **Green button** — its local function (refresh) runs via the
   normal boot refresh after any wake; no special casing needed.
 - **Awake window (Q2: 30 s)** — armed once the clock syncs after a

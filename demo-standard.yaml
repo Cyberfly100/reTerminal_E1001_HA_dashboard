@@ -1,0 +1,1423 @@
+# Board: Generic ESP32-S3 Board (Generic)
+# Definition: definitions/boards/generic-esp32s3/manifest.yaml
+
+# Everything a new user has to point at their own
+# Home Assistant instance; the rest of the config
+# only references these (see docs/community-plan.md
+# for the roadmap around them)
+substitutions:
+  # Any weather.* entity works; fields the provider
+  # does not serve degrade to placeholders (see
+  # docs/weather-data.md for the field matrix)
+  weather_entity: weather.forecast_home
+
+  # Calendars merged into the right panel; disable
+  # any of them with 'false'
+  calendar_1_enabled: 'true'
+  calendar_1_entity: calendar.family
+  calendar_2_enabled: 'true'
+  calendar_2_entity: calendar.birthdays
+  calendar_3_enabled: 'false'
+  calendar_3_entity: calendar.holidays
+  calendar_4_enabled: 'false'
+  calendar_4_entity: calendar.work
+
+  # 'true': rows whose field the weather provider
+  # does not serve are hidden (rows collapse) instead
+  # of drawn as placeholders; 'false' keeps the
+  # placeholder look
+  hide_missing: 'true'
+
+  # Canned data instead of Home Assistant fetches, so
+  # the layout can be tried with no HA wiring at all
+  # (see docs/testing.md)
+  demo_mode: 'true'
+
+  # Demo mode only: the header status text (instead of
+  # the Home Assistant entity / the "all systems
+  # nominal" fallback), and a comma-separated list of
+  # demo fields to blank — the dynamic layout (hidden
+  # rows with hide_missing, placeholders otherwise) can
+  # then be tested without any HA wiring. Field names:
+  # uv, humidity, wind, low, high, uvmax, precipitation,
+  # calendars (the last one empties the calendar panel,
+  # switching the layout to full-width weather)
+  demo_status: 'Demo mode — canned data'
+  demo_missing: ''
+
+  # Battery saver (see docs/battery-saver-plan.md):
+  # deep sleep between refreshes while on battery.
+  # Sleep duration, awake window after a timer wake,
+  # and interactive window after a button wake, all
+  # in seconds
+  battery_saver: 'true'
+  battery_sleep_seconds: '900'
+  battery_awake_seconds: '30'
+  battery_button_awake_seconds: '120'
+
+  # Home Assistant input_boolean that keeps the
+  # device awake while on (create it in HA; until it
+  # exists or answers, the device sleeps normally).
+  # Setting it while the device is asleep takes effect
+  # at the next wake
+  keep_awake_entity: input_boolean.e1001_keep_awake
+
+  # Optional header status text; until it answers the
+  # header shows its fallback text
+  dashboard_status_entity: input_text.dashboard_status
+
+  # Temperature unit of the weather entity ('°C' or
+  # '°F'). Only the Feels Like sensor's unit label is
+  # static in ESPHome — everything else (formulas,
+  # display suffixes) adapts automatically from the
+  # entity's temperature_unit attribute
+  temperature_unit: '°C'
+
+esphome:
+  name: reterminal-e1001-entrance
+  friendly_name: reterminal_e1001_entrance
+  includes:
+    - display_helpers.h
+    - weather_helpers.h
+    - calendar_helpers.h
+    - battery_helpers.h
+    - sleep_helpers.h
+    - fetch_helpers.h
+    - demo_helpers.h
+  on_boot:
+    # Enable the battery measurement bridge early
+    # (before component setup) with settle time, so
+    # the first ADC readings are valid
+    - priority: 600
+      then:
+        - output.turn_on: bsp_battery_enable
+        - delay: 200ms
+        # Remember which button woke the device (a no-op
+        # on a normal power-on); the mask drives the HA
+        # replay and the longer interactive window
+        - lambda: 'wake_cause_read();'
+
+    - priority: -100
+      then:
+        - delay: 5s
+        # Boot hatch: green held ~5 s after a wake keeps
+        # the device awake for this session (OTA, logs,
+        # debugging) — the button has been polled long
+        # enough by now for its state to be reliable.
+        #
+        # There is deliberately NO refresh here: before
+        # HA (re)connects, homeassistant.action calls are
+        # silently dropped and their fetch tickets would
+        # hang until the watchdog — the first refresh of
+        # a boot is the one triggered by the time sync
+        # (see the time component below), i.e. the first
+        # moment fetches can actually succeed; until
+        # then the e-ink keeps its frame
+        - if:
+            condition:
+              binary_sensor.is_on: button_green
+            then:
+              - lambda: 'id(sleep_hold_active) = true;'
+              - logger.log:
+                  format: "Battery saver: boot hatch engaged — staying awake"
+                  level: INFO
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+logger:
+  # The E1001's USB-C goes through a USB-to-UART bridge
+  # on UART0 (GPIO43/44) — NOT the ESP32-S3's native
+  # USB_SERIAL_JTAG, whose fixed pins (GPIO19/20) this
+  # board uses as the sensor I2C bus (SHT4x + PCF8563).
+  # The S3 default (USB_SERIAL_JTAG) muxes the log
+  # output onto the I2C pins and leaves the USB port
+  # silent; UART0 puts the logs on the bridge
+  hardware_uart: UART0
+
+api:
+  encryption:
+    key: !secret reterminal_e1001_entrance__encryption_key
+  # The wake-button replay used to run here, at the
+  # first client's authentication — but that raced the
+  # client's state subscription (a 500 ms pulse could
+  # finish before HA subscribed, so HA never saw the
+  # on edge and the button automations never fired).
+  # It now runs from the 5 s battery saver tick,
+  # gated on Home Assistant having pushed entity
+  # states — only subscribers receive those — see
+  # battery_saver_tick() in sleep_helpers.h
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Join the saved network without scanning first — the
+  # scan costs 3-8 s on every boot, and on deep-sleep
+  # wake boots that sits squarely between the button
+  # press and the HA automation it fires. With several
+  # saved networks it picks the strongest instead of
+  # letting the scan decide; an unreachable AP still
+  # falls back to the hotspot below
+  fast_connect: true
+  ap:
+    ssid: reterminal_e100 Fallback Hotspot
+    password: !secret reterminal_e1001_entrance__ap_password
+captive_portal:
+
+output:
+  - platform: ledc   # CORRECTED: 'ledc' is the correct platform for ESP32 PWM.
+    pin: GPIO45
+    id: buzzer_pwm
+    # The frequency determines the pitch of the buzzer's sound. 1000Hz is a mid-range tone.
+    frequency: 1000Hz
+
+  # Battery voltage divider enable; must be on
+  # for the GPIO1 ADC to see the battery
+  - platform: gpio
+    pin: GPIO21
+    id: bsp_battery_enable
+
+# Create a light entity to provide a user-friendly way to control the buzzer.
+# The 'brightness' of the light will control the PWM duty cycle, which effectively changes the buzzer's volume.
+light:
+  - platform: monochromatic
+    output: buzzer_pwm
+    name: "Buzzer"
+    id: buzzer
+    # Setting transition length to 0s makes the buzzer turn on and off instantly.
+    default_transition_length: 0s
+
+# Momentary button signals for Home Assistant: one
+# event entity, one type per button. Stateless by
+# design — no on/off pair, no stuck entity, and nothing
+# for the api's deferred, state-deduplicated sends to
+# collapse (the failure mode of the earlier binary-
+# sensor pulse). Automations use HA's "Event received"
+# trigger with the type as the option; the entity's
+# state is the timestamp of the last event, so the
+# press remains visible even after the device sleeps.
+# The buttons themselves are internal binary sensors
+# (see below) — their presses fire the matching type
+# here, whether natural or replayed from a sleep wake
+event:
+  - platform: template
+    name: "E1001 Buttons"
+    id: e1001_buttons
+    device_class: button
+    event_types:
+      - green
+      - middle
+      - left
+
+binary_sensor:
+  # Green button - refresh display
+  - platform: gpio
+    id: button_green
+    internal: true
+    pin:
+      number: GPIO3
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      then:
+        - script.execute: refresh_dashboard
+        # Someone is interacting: extend the awake
+        # window while the battery saver governs
+        - lambda: 'extend_awake_window();'
+        - event.trigger:
+            id: e1001_buttons
+            event_type: green
+
+  # Middle white button
+  - platform: gpio
+    id: button_middle
+    internal: true
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      then:
+        - lambda: 'extend_awake_window();'
+        - event.trigger:
+            id: e1001_buttons
+            event_type: middle
+
+  # Left white button
+  - platform: gpio
+    id: button_left
+    internal: true
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+    on_press:
+      then:
+        - lambda: 'extend_awake_window();'
+        - event.trigger:
+            id: e1001_buttons
+            event_type: left
+
+  # Input source present (read from the SY6974B
+  # charger on the I2C bus, refreshed every 5 s by
+  # the battery saver tick); silence on both buses
+  # leaves the pack voltage to decide, and the brief
+  # window before the first read counts as present —
+  # the fail-safe direction
+  - platform: template
+    name: "External Power"
+    id: external_power
+    device_class: plug
+    lambda: 'return external_power_present();'
+
+  # Home Assistant "keep awake" override; consulted
+  # by the sleep decision (sleep_helpers.h). Internal:
+  # it mirrors the helper, no value re-exposing it
+  - platform: homeassistant
+    id: sleep_hold_ha
+    entity_id: ${keep_awake_entity}
+    internal: true
+
+# Virtual button exposed to Home Assistant to trigger a display refresh
+button:
+  - platform: template
+    name: "E1001 Refresh Display"
+    id: refresh_display_button
+    on_press:
+      then:
+        - script.execute: refresh_dashboard
+
+# Number of refresh fetch tickets still outstanding;
+# every fetch action registers one via fetch_begin()
+# (fetch_helpers.h) and returns it via fetch_complete()
+# from both its on_success and on_error; the display
+# redraws once the last ticket returns
+globals:
+  - id: pending_fetches
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # Fetch watchdog deadline (epoch seconds), armed at
+  # each cycle start; 0 = disarmed. A 5 s interval
+  # (fetch_watchdog_tick) forces a redraw when tickets
+  # are still outstanding past it, so a single hung
+  # fetch cannot freeze the dashboard until the next
+  # cycle
+  - id: fetch_deadline
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # True while the weather entity reports temperatures
+  # in °F; kept in sync from the temperature_unit
+  # attribute via the met_temperature_unit sensor below.
+  # The initial value comes from the temperature_unit
+  # substitution, so the °C/°F handling is already right
+  # before the attribute arrives (and in demo mode,
+  # where no attribute ever arrives)
+  - id: temp_is_fahrenheit
+    type: bool
+    restore_value: false
+    initial_value: 'temp_unit_is_f("${temperature_unit}")'
+
+  # Whether rows whose field the provider does not
+  # serve are hidden instead of shown as placeholders;
+  # static from the hide_missing substitution
+  - id: display_hide_missing
+    type: bool
+    restore_value: false
+    initial_value: '${hide_missing}'
+
+  # Battery saver state (see sleep_helpers.h and
+  # docs/battery-saver-plan.md); the seconds values
+  # are static from their substitutions
+  - id: battery_saver_enabled
+    type: bool
+    restore_value: false
+    initial_value: '${battery_saver}'
+
+  - id: sleep_hold_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: battery_sleep_seconds
+    type: int
+    restore_value: false
+    initial_value: '${battery_sleep_seconds}'
+
+  - id: battery_awake_seconds
+    type: int
+    restore_value: false
+    initial_value: '${battery_awake_seconds}'
+
+  - id: battery_button_awake_seconds
+    type: int
+    restore_value: false
+    initial_value: '${battery_button_awake_seconds}'
+
+  # Guards the one-shot initial refresh of each boot:
+  # set when Home Assistant entity states have arrived (a
+  # state push only HA performs — any API client answers
+  # the device's time request, the esphome CLI included,
+  # so a time sync alone does not prove HA is reachable)
+  # and one initial refresh has been dispatched. Failed
+  # first attempts fall back to the 300 s interval
+  - id: initial_refresh_done
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # Demo mode as a runtime flag for the helper headers
+  # (substitutions only expand inside the YAML text, so
+  # the headers read this global instead — the display's
+  # current-weather values use it to prefer the canned
+  # slot 0 over live attributes, keeping demo mode fully
+  # canned even when HA happens to be connected, and
+  # letting demo_missing blank the current rows)
+  - id: demo_mode_enabled
+    type: bool
+    restore_value: false
+    initial_value: '${demo_mode}'
+
+  # The demo_missing field list for the same reason:
+  # demo_helpers.h reads this global (an empty string
+  # means nothing is missing)
+  - id: demo_missing_list
+    type: std::string
+    restore_value: false
+    initial_value: '"${demo_missing}"'
+
+  # Calendar fetch window, precomputed once per
+  # refresh in refresh_dashboard; the data_template
+  # lambdas of the calendar actions run in a context
+  # where the custom include headers are not visible
+  # on ESPHome 2026.10.0 (esphome/esphome#21303, fixed
+  # by #21307), so they read these globals instead of
+  # calling the helpers in calendar_helpers.h directly.
+  # Can be simplified back to direct helper calls once
+  # the build host runs an ESPHome version with the
+  # fix.
+  - id: calendar_fetch_start
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+  - id: calendar_fetch_end
+    type: std::string
+    restore_value: false
+    initial_value: '""'
+
+# define font to display words
+font:
+  - file: "gfonts://Inter@700"
+    id: Inter_medium
+    size: 22
+    # Latin Core also covers å, ä, ö for calendar
+    # event summaries
+    glyphsets:
+      - GF_Latin_Core
+    ignore_missing_glyphs: true
+  - file: "gfonts://Inter@700"
+    id: Inter_tiny
+    size: 16
+    glyphsets:
+      - GF_Latin_Core
+    ignore_missing_glyphs: true
+  - file: "fonts/Montserrat-Black.ttf"
+    id: Montserrat_large
+    size: 100
+  - file: 'fonts/materialdesignicons-webfont.ttf'  # Path to the font file
+    id: weather_icon_large
+    size: 110
+    glyphs: &mdi-weather-glyphs
+      - "\U000F0594" # clear-night
+      - "\U000F0590" # cloudy
+      - "\U000F0591" # fog
+      - "\U000F0592" # hail
+      - "\U000F0593" # lightning
+      - "\U000F067E" # lightning-rainy
+      - "\U000F0595" # partlycloudy
+      - "\U000F0596" # pouring
+      - "\U000F0597" # rainy
+      - "\U000F0598" # snowy
+      - "\U000F067F" # snowy-rainy
+      - "\U000F0599" # sunny
+      - "\U000F059D" # windy
+      - "\U000F059E" # windy-variant
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_medium   # Medium icon size
+    size: 40
+    glyphs: *mdi-weather-glyphs
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_small    # Small icon size, optically
+    size: 26              # matched to Inter_medium text
+    glyphs:
+      - "\U000F058E" # water-percent (humidity)
+      - "\U000F059D" # weather-windy (wind speed)
+      - "\U000F054A" # umbrella (precipitation probability)
+      - "\U000F0450" # refresh (last refresh time)
+      - "\U000F0045" # arrow-down (daily low)
+      - "\U000F005D" # arrow-up (daily high)
+      - "\U000F007A" # battery-10 (header battery level)
+      - "\U000F007B" # battery-20
+      - "\U000F007C" # battery-30
+      - "\U000F007D" # battery-40
+      - "\U000F007E" # battery-50
+      - "\U000F007F" # battery-60
+      - "\U000F0080" # battery-70
+      - "\U000F0081" # battery-80
+      - "\U000F0082" # battery-90
+      - "\U000F0079" # battery (100% level, shown at 99%)
+      - "\U000F0A4F" # hand (feels like)
+      - "\U000F04E0" # sunglasses (UV index)
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: font_mdi_battery  # Large icon for the battery
+    size: 220              # warning screen
+    glyphs:
+      - "\U000F008E" # battery-outline (empty)
+
+# define SPI interface
+spi:
+  clk_pin: GPIO7
+  mosi_pin: GPIO9
+
+# Charger I2C bus (SDA GPIO39, SCL GPIO40): the
+# Silergy SY6974B at 0x6B reports whether an input
+# source is present (see battery_helpers.h and
+# docs/battery-saver-plan.md)
+i2c:
+  - id: charger_i2c
+    sda: GPIO39
+    scl: GPIO40
+    frequency: 100kHz
+
+  # Sensor/expansion I2C bus (SHT4x and PCF8563 per the
+  # schematic); scanned for diagnostics, and the
+  # charger read falls back to it in case other board
+  # revisions route the charger there
+  - id: sensor_i2c
+    sda: GPIO19
+    scl: GPIO20
+    frequency: 100kHz
+
+sensor:
+  - platform: homeassistant
+    id: met_temperature
+    entity_id: ${weather_entity}
+    attribute: temperature
+    # Recompute feels like right after every input
+    # change, so any display redraw (manual or timed)
+    # after the HA states arrived already shows it,
+    # instead of waiting for the 60s poll of the
+    # template sensor. This state push is also the most
+    # reliable "HA is connected" signal (only HA pushes
+    # entity states), so the one-shot initial refresh of
+    # each boot is anchored here as well — see the time
+    # component's on_time_sync
+    on_value:
+      then:
+        - component.update: met_feels_like
+        # Replay a wake button press shortly after Home
+        # Assistant's states arrive. NOT inline here:
+        # this automation runs inside the api message
+        # handler for the state push, BEFORE Home
+        # Assistant's device-entity subscription is
+        # processed — anything published at that moment
+        # has no subscriber and is silently dropped
+        # (observed: the entire pulse swallowed; HA
+        # logged only the subscription burst's final
+        # state). The pulse is scheduled ~750 ms out,
+        # past the message backlog — see
+        # defer_wake_button_replay()
+        - lambda: 'defer_wake_button_replay();'
+        - if:
+            condition:
+              and:
+                - lambda: 'return !id(initial_refresh_done);'
+                - lambda: 'return id(pending_fetches) == 0;'
+            then:
+              - lambda: 'id(initial_refresh_done) = true;'
+              - script.execute: refresh_dashboard
+              - lambda: 'arm_awake_window_for_wake();'
+  
+  - platform: homeassistant
+    id: met_humidity
+    entity_id: ${weather_entity}
+    attribute: humidity
+    on_value:
+      then:
+        - component.update: met_feels_like
+
+  - platform: homeassistant
+    id: met_wind_speed
+    entity_id: ${weather_entity}
+    attribute: wind_speed
+    on_value:
+      then:
+        - component.update: met_feels_like
+
+  # Feels like temperature; the wind chill / heat
+  # index approximation lives in weather_helpers.h.
+  # The label is static in ESPHome (set it via the
+  # temperature_unit substitution); the value itself
+  # adapts automatically once the entity's
+  # temperature_unit attribute has arrived
+  - platform: template
+    id: met_feels_like
+    name: "Feels Like"
+    device_class: temperature
+    unit_of_measurement: '${temperature_unit}'
+    lambda: |-
+      const float feels_like = feels_like_temperature();
+
+      if (isnan(feels_like)) {
+        return {};
+      }
+
+      return feels_like;
+    update_interval: 60s
+  
+  # Battery voltage via ADC; the measured value is
+  # half the actual battery voltage (divider)
+  - platform: adc
+    pin: GPIO1
+    id: battery_voltage
+    name: "Battery Voltage"
+    update_interval: 60s
+    attenuation: 12db
+    filters:
+      - multiply: 2.0
+      # Drop impossible readings (unsettled measurement
+      # bridge after power-on reads ~0 V): a running 1S
+      # LiPo can never be below 2.5 V. Applies to the
+      # compensated value, hence after multiply
+      - lambda: 'if (x < 2.5f) return {}; return x;'
+    # Recompute the percentage right after every
+    # voltage publish, so level and voltage can never
+    # disagree (one stale garbage sample used to show
+    # "0%" with a full battery)
+    on_value:
+      then:
+        - component.update: battery_level
+
+  # Battery percentage derived from the voltage
+  # (calibration table from the Seeed wiki)
+  - platform: template
+    id: battery_level
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    # Drop NaN (no voltage reading yet) rather than
+    # letting the clamp filter coerce it to 0%
+    lambda: |-
+      if (isnan(id(battery_voltage).state)) {
+        return {};
+      }
+      return id(battery_voltage).state;
+    update_interval: 60s
+    filters:
+      # method: exact is required: calibrate_linear
+      # defaults to least_squares, which collapses the
+      # table into one straight line — that line reads
+      # above 100 % for anything over ~4.08 V, so the
+      # clamp pins the level to 100 % across the whole
+      # top of the range and the battery row (hidden at
+      # 100 %) never appears. exact interpolates the
+      # table segment by segment instead
+      - calibrate_linear:
+          method: exact
+          # ascending — the exact method requires it
+          datapoints:
+            - 3.27 -> 0.0
+            - 3.30 -> 5.0
+            - 3.41 -> 10.0
+            - 3.49 -> 20.0
+            - 3.58 -> 30.0
+            - 3.68 -> 40.0
+            - 3.75 -> 50.0
+            - 3.80 -> 60.0
+            - 3.85 -> 70.0
+            - 3.91 -> 80.0
+            - 3.96 -> 90.0
+            - 4.15 -> 100.0
+      - clamp:
+          min_value: 0
+          max_value: 100
+
+text_sensor:
+  # Wake diagnostics: how the current session woke
+  # (button mask / refresh timer / reset reason). The
+  # boot-moment log line fires before any API client
+  # can attach, so this sensor is the reliable way to
+  # read it after the fact — e.g. after a button-wake
+  # test of the replay
+  - platform: template
+    name: "E1001 Wake Info"
+    id: wake_info_sensor
+    lambda: 'return std::string(wake_info);'
+    update_interval: 60s
+
+  - platform: homeassistant
+    id: met_condition
+    entity_id: ${weather_entity}
+
+  - platform: homeassistant
+    id: met_wind_speed_unit
+    entity_id: ${weather_entity}
+    attribute: wind_speed_unit
+    # The unit may arrive after the wind speed itself;
+    # recompute feels like so the km/h conversion is
+    # applied without waiting for the next poll
+    on_value:
+      then:
+        - component.update: met_feels_like
+
+  # Temperature unit of the weather entity; drives the
+  # °C/°F handling (feels like conversion, display
+  # suffixes). Like the wind unit it may arrive after
+  # the temperature itself, so recompute feels like
+  # once it lands
+  - platform: homeassistant
+    id: met_temperature_unit
+    entity_id: ${weather_entity}
+    attribute: temperature_unit
+    on_value:
+      then:
+        - lambda: |-
+            id(temp_is_fahrenheit) = (x == "°F");
+        - component.update: met_feels_like
+
+  # Status text for the header bar, controlled from
+  # Home Assistant; falls back to the default below
+  # until a state arrives
+  - platform: homeassistant
+    id: dashboard_status
+    entity_id: ${dashboard_status_entity}
+
+# Time source for the "last refresh" display in the header
+time:
+  - platform: homeassistant
+    id: home_time
+    # A time sync alone does not mean Home Assistant is
+    # reachable: ANY authenticated API client answers the
+    # device's time request (the esphome CLI does — it
+    # synced the clock at setup in the logs this was
+    # debugged with), and the sync trigger re-fires on
+    # every periodic response. The initial refresh is
+    # therefore anchored on HA entity states having
+    # arrived (only HA pushes those) and latched once
+    # per boot; the met_temperature on_value anchor below
+    # covers the case where the sync fires just before
+    # the state push lands
+    on_time_sync:
+      then:
+        - if:
+            condition:
+              and:
+                - lambda: 'return !id(initial_refresh_done);'
+                - lambda: 'return id(met_temperature).has_state();'
+            then:
+              - lambda: 'id(initial_refresh_done) = true;'
+              - script.execute: refresh_dashboard
+              # (Re-)arm the battery saver's real awake window
+              # at the moment data can actually be fetched —
+              # latched with the guard above, so the periodic
+              # time responses cannot keep the device awake
+              # forever
+              - lambda: 'arm_awake_window_for_wake();'
+
+script:
+  - id: refresh_dashboard
+    then:
+      # Demo mode: canned data instead of the Home
+      # Assistant fetches, so the layout can be tried
+      # with no HA wiring at all (docs/testing.md); the
+      # fetch tickets and watchdog are unused on this
+      # path
+      - if:
+          condition:
+            lambda: 'return ${demo_mode};'
+          then:
+            - lambda: |-
+                load_demo_data();
+            - lambda: 'id(epaper_display).update();'
+          else:
+            - script.execute: refresh_fetches
+
+  # The production fetch cycle; its own script so the
+  # demo branch above can bypass it entirely
+  - id: refresh_fetches
+    then:
+      # New cycle: reset the fetch tickets and arm the
+      # watchdog (fetch_cycle_begin), clear the calendar
+      # events here, before any calendar action runs, so
+      # all calendar fetches append into a fresh list
+      # regardless of the order in which their responses
+      # arrive. The fetch window is precomputed here too,
+      # before the actions run
+      - lambda: |-
+          fetch_cycle_begin();
+          calendar_events.clear();
+
+          id(calendar_fetch_start) = calendar_window_start();
+          id(calendar_fetch_end) = calendar_window_end();
+
+      # Daily forecast for today's low/high and max UV,
+      # fetched first so the hourly refresh below
+      # already draws it
+      - lambda: 'fetch_begin();'
+      - homeassistant.action:
+          action: weather.get_forecasts
+          data:
+            entity_id: ${weather_entity}
+            type: daily
+
+          capture_response: true
+
+          response_template: >
+            {
+              "low": {{ response['${weather_entity}']['forecast'][0]['templow'] | float }},
+              "high": {{ response['${weather_entity}']['forecast'][0]['temperature'] | float }},
+              "uv_max": {{ response['${weather_entity}']['forecast'][0]['uv_index'] | default(-1) }}
+            }
+
+          on_success:
+            - lambda: |-
+                daily_low =
+                    response["response"]["low"].as<float>();
+                daily_high =
+                    response["response"]["high"].as<float>();
+                daily_uv_max =
+                    response["response"]["uv_max"].as<float>();
+
+                // -1 sentinel: the forecast entry carried
+                // no uv_index (NAN cannot travel through
+                // JSON)
+                if (daily_uv_max < 0.0f) {
+                  daily_uv_max = NAN;
+                }
+
+                fetch_complete();
+
+          on_error:
+            - logger.log:
+                format: "Failed to retrieve daily weather forecast"
+                level: WARN
+            - lambda: 'fetch_complete();'
+
+      - lambda: 'fetch_begin();'
+      - homeassistant.action:
+          action: weather.get_forecasts
+          data:
+            entity_id: ${weather_entity}
+            type: hourly
+
+          capture_response: true
+
+          # The union of the two strip grids, ascending:
+          # 0/3/6/9 (3-hour, the split column) and
+          # 0/2/4/…/14 (2-hour, the wide no-calendar
+          # layout). The layout switch is runtime — a
+          # quiet week releases the calendar half — so
+          # either grid may be needed after any fetch;
+          # each entry is tagged with its hour offset and
+          # the strip selects its grid by that tag at
+          # draw time. The length guard skips offsets a
+          # shorter provider forecast does not carry
+          # instead of failing the whole template
+          response_template: >
+            {
+              "forecast": [
+                {% for i in [0, 2, 3, 4, 6, 8, 9, 10, 12, 14]
+                   if response['${weather_entity}']['forecast'] | length > i %}
+                {
+                  "hours_ahead": {{ i }},
+                  "time": "{{ as_timestamp(response['${weather_entity}']['forecast'][i]['datetime']) | timestamp_custom('%H:%M') }}",
+                  "condition": "{{ response['${weather_entity}']['forecast'][i]['condition'] }}",
+                  "temperature": {{ response['${weather_entity}']['forecast'][i]['temperature'] | float }},
+                  "precipitation_probability": {{ response['${weather_entity}']['forecast'][i]['precipitation_probability'] | default(-1) }},
+                  "uv_index": {{ response['${weather_entity}']['forecast'][i]['uv_index'] | default(-1) }},
+                  "humidity": {{ response['${weather_entity}']['forecast'][i]['humidity'] | default(-1) }},
+                  "wind_speed": {{ response['${weather_entity}']['forecast'][i]['wind_speed'] | default(-1) }}
+                }{% if not loop.last %},{% endif %}
+                {% endfor %}
+              ]
+            }
+
+          on_success:
+            - lambda: |-
+                JsonArrayConst forecast =
+                    response["response"]["forecast"];
+
+                forecast_slots.clear();
+
+                for (JsonVariantConst item : forecast) {
+                  ForecastSlot slot;
+
+                  slot.time =
+                      item["time"].as<std::string>();
+                  slot.condition =
+                      item["condition"].as<std::string>();
+                  slot.temperature =
+                      item["temperature"].as<float>();
+                  slot.precipitation_probability =
+                      item["precipitation_probability"].as<float>();
+                  slot.uv_index =
+                      item["uv_index"].as<float>();
+                  slot.humidity =
+                      item["humidity"].as<float>();
+                  slot.wind_speed =
+                      item["wind_speed"].as<float>();
+
+                  // The fetch template's own offset tag,
+                  // not provider data — see the template
+                  // comment above
+                  slot.hours_ahead =
+                      item["hours_ahead"].as<int>();
+
+                  // -1 sentinels: the entry carried no
+                  // such field
+                  if (slot.precipitation_probability <
+                      0.0f) {
+                    slot.precipitation_probability =
+                        NAN;
+                  }
+
+                  if (slot.uv_index < 0.0f) {
+                    slot.uv_index = NAN;
+                  }
+
+                  if (slot.humidity < 0.0f) {
+                    slot.humidity = NAN;
+                  }
+
+                  if (slot.wind_speed < 0.0f) {
+                    slot.wind_speed = NAN;
+                  }
+
+                  forecast_slots.push_back(slot);
+                }
+
+                auto now = id(home_time).now();
+
+                if (now.is_valid()) {
+                  set_last_refresh(now);
+                }
+
+                fetch_complete();
+
+          on_error:
+            - logger.log:
+                format: "Failed to retrieve hourly weather forecast"
+                level: WARN
+            - lambda: 'fetch_complete();'
+
+      # Calendar events for the next 14 days; skipped when
+      # the clock is not yet synced (the window would be
+      # invalid) — the first time sync triggers another
+      # refresh via on_time_sync. Multiple calendars are
+      # fetched and merged, with duplicates removed at
+      # draw time (same event in two calendars). Each
+      # calendar can be disabled via its ${calendar_N_enabled}
+      # substitution; a disabled (or clock-skipped) calendar
+      # simply registers no fetch ticket, so the redraw
+      # accounting needs no compensation here
+      - if:
+          condition:
+            lambda: 'return id(home_time).now().is_valid();'
+          then:
+          - if:
+              condition:
+                lambda: 'return ${calendar_1_enabled};'
+              then:
+              - lambda: 'fetch_begin();'
+              - homeassistant.action:
+                  action: calendar.get_events
+                  data:
+                    entity_id: ${calendar_1_entity}
+
+                  data_template:
+                    start_date_time: !lambda |-
+                      return id(calendar_fetch_start);
+
+                    end_date_time: !lambda |-
+                      return id(calendar_fetch_end);
+
+                  capture_response: true
+
+                  # The start/end fields are passed through as-is;
+                  # depending on the HA version they are ISO 8601
+                  # strings or {"dateTime": ...}/{"date": ...}
+                  # objects. The normalization happens in the
+                  # on_success lambda below.
+                  response_template: >
+                    {
+                      "events": [
+                        {% for item in response['${calendar_1_entity}']['events'] %}
+                        {
+                          "start": {{ item['start'] | to_json }},
+                          "end": {{ item['end'] | to_json }},
+                          "summary": {{ item['summary'] | default('') | to_json }}
+                        }{% if not loop.last %},{% endif %}
+                        {% endfor %}
+                      ]
+                    }
+
+                  on_success:
+                    - lambda: |-
+                        parse_calendar_events(
+                            response["response"]["events"]
+                        );
+
+                        fetch_complete();
+
+                  on_error:
+                    - logger.log:
+                        format: "Failed to retrieve calendar 1 events: %s"
+                        args: ['error.c_str()']
+                        level: WARN
+                    - lambda: 'fetch_complete();'
+
+          - if:
+              condition:
+                lambda: 'return ${calendar_2_enabled};'
+              then:
+              - lambda: 'fetch_begin();'
+              - homeassistant.action:
+                  action: calendar.get_events
+                  data:
+                    entity_id: ${calendar_2_entity}
+
+                  data_template:
+                    start_date_time: !lambda |-
+                      return id(calendar_fetch_start);
+
+                    end_date_time: !lambda |-
+                      return id(calendar_fetch_end);
+
+                  capture_response: true
+
+                  response_template: >
+                    {
+                      "events": [
+                        {% for item in response['${calendar_2_entity}']['events'] %}
+                        {
+                          "start": {{ item['start'] | to_json }},
+                          "end": {{ item['end'] | to_json }},
+                          "summary": {{ item['summary'] | default('') | to_json }}
+                        }{% if not loop.last %},{% endif %}
+                        {% endfor %}
+                      ]
+                    }
+
+                  on_success:
+                    - lambda: |-
+                        parse_calendar_events(
+                            response["response"]["events"]
+                        );
+
+                        fetch_complete();
+
+                  on_error:
+                    - logger.log:
+                        format: "Failed to retrieve calendar 2 events: %s"
+                        args: ['error.c_str()']
+                        level: WARN
+                    - lambda: 'fetch_complete();'
+
+          - if:
+              condition:
+                lambda: 'return ${calendar_3_enabled};'
+              then:
+              - lambda: 'fetch_begin();'
+              - homeassistant.action:
+                  action: calendar.get_events
+                  data:
+                    entity_id: ${calendar_3_entity}
+
+                  data_template:
+                    start_date_time: !lambda |-
+                      return id(calendar_fetch_start);
+
+                    end_date_time: !lambda |-
+                      return id(calendar_fetch_end);
+
+                  capture_response: true
+
+                  response_template: >
+                    {
+                      "events": [
+                        {% for item in response['${calendar_3_entity}']['events'] %}
+                        {
+                          "start": {{ item['start'] | to_json }},
+                          "end": {{ item['end'] | to_json }},
+                          "summary": {{ item['summary'] | default('') | to_json }}
+                        }{% if not loop.last %},{% endif %}
+                        {% endfor %}
+                      ]
+                    }
+
+                  on_success:
+                    - lambda: |-
+                        parse_calendar_events(
+                            response["response"]["events"]
+                        );
+
+                        fetch_complete();
+
+                  on_error:
+                    - logger.log:
+                        format: "Failed to retrieve calendar 3 events: %s"
+                        args: ['error.c_str()']
+                        level: WARN
+                    - lambda: 'fetch_complete();'
+
+          - if:
+              condition:
+                lambda: 'return ${calendar_4_enabled};'
+              then:
+              - lambda: 'fetch_begin();'
+              - homeassistant.action:
+                  action: calendar.get_events
+                  data:
+                    entity_id: ${calendar_4_entity}
+
+                  data_template:
+                    start_date_time: !lambda |-
+                      return id(calendar_fetch_start);
+
+                    end_date_time: !lambda |-
+                      return id(calendar_fetch_end);
+
+                  capture_response: true
+
+                  response_template: >
+                    {
+                      "events": [
+                        {% for item in response['${calendar_4_entity}']['events'] %}
+                        {
+                          "start": {{ item['start'] | to_json }},
+                          "end": {{ item['end'] | to_json }},
+                          "summary": {{ item['summary'] | default('') | to_json }}
+                        }{% if not loop.last %},{% endif %}
+                        {% endfor %}
+                      ]
+                    }
+
+                  on_success:
+                    - lambda: |-
+                        parse_calendar_events(
+                            response["response"]["events"]
+                        );
+
+                        fetch_complete();
+
+                  on_error:
+                    - logger.log:
+                        format: "Failed to retrieve calendar 4 events: %s"
+                        args: ['error.c_str()']
+                        level: WARN
+                    - lambda: 'fetch_complete();'
+
+interval:
+  # Fetch watchdog (force a redraw when a fetch hung)
+  # and battery saver tick (power state, awake window,
+  # deep sleep entry) — both no-ops whenever the
+  # dashboard is powered and healthy
+  - interval: 5s
+    then:
+      - lambda: |-
+          fetch_watchdog_tick();
+          battery_saver_tick();
+
+  # Fast-path delivery of the wake-button replay: the
+  # same check the 5 s battery-saver tick does as a
+  # backstop, at 500 ms granularity, so a press that
+  # woke the device reaches its HA automation ~2 s
+  # after the state pushes arrive instead of up to 7 —
+  # see wake_replay_fast_tick() in sleep_helpers.h
+  - interval: 500ms
+    then:
+      - lambda: 'wake_replay_fast_tick();'
+
+  # Regular refresh cycle. ESPHome's scheduler fires an
+  # interval's FIRST execution immediately after setup
+  # (scheduler.cpp: "first execution happens immediately
+  # after a random smallish offset", up to 5 s — not after
+  # one full period), so this tick used to dispatch
+  # fetches into a not-yet-reconnected Home Assistant on
+  # every boot: the actions are silently dropped, the
+  # watchdog forces a placeholder redraw at +20 s, and
+  # the real frame only follows at HA reconnect +30 s.
+  # The refresh is therefore gated on the weather entity
+  # having state — HA pushes states when it connects, so
+  # ticks before that are pointless and skipped (demo
+  # mode needs no HA at all; its first frame comes from
+  # this interval instead of the state-push anchor)
+  - interval: 300s
+    then:
+      - if:
+          condition:
+            or:
+              - lambda: 'return ${demo_mode};'
+              - lambda: 'return id(met_temperature).has_state();'
+          then:
+            - script.execute: refresh_dashboard
+
+display:
+  - platform: waveshare_epaper
+    id: epaper_display
+    model: 7.50inv2alt
+
+    cs_pin: GPIO10
+    dc_pin: GPIO11
+
+    reset_pin:
+      number: GPIO12
+      inverted: false
+
+    busy_pin:
+      number: GPIO13
+      inverted: true
+
+    update_interval: never
+
+    lambda: |-
+      const int W = it.get_width();
+      const int H = it.get_height();
+
+      // Battery warning screen replaces the whole
+      // dashboard when the battery is low
+      if (battery_is_low()) {
+        draw_battery_warning(it);
+        return;
+      }
+
+      constexpr int MARGIN = 5;
+      constexpr int GAP = 10;
+      constexpr int CORNER_RADIUS = 10;
+      constexpr int HEADER_INSET = 15;
+
+      // Header
+      const int HEADER_HEIGHT = H * 15 / 100;
+
+      // Content
+      const int CONTENT_Y =
+          MARGIN + HEADER_HEIGHT + GAP;
+
+      const int CONTENT_HEIGHT =
+          H - CONTENT_Y - MARGIN;
+
+      // Columns
+      const int COLUMN_WIDTH =
+          (W - (2 * MARGIN) - GAP) / 2;
+
+      const int LEFT_X = MARGIN;
+
+      const int RIGHT_X =
+          MARGIN + COLUMN_WIDTH + GAP;
+
+
+      // --------------------------------------------------
+      // Header
+      // --------------------------------------------------
+
+      rounded_rectangle(
+          it,
+          LEFT_X,
+          MARGIN,
+          W - (2 * MARGIN),
+          HEADER_HEIGHT,
+          CORNER_RADIUS
+      );
+
+      // Status text from Home Assistant, or the
+      // default if no state has arrived yet; demo mode
+      // shows its canned status instead (substitution)
+      std::string status_text = "all systems nominal";
+
+      if (${demo_mode}) {
+        status_text = "${demo_status}";
+      } else if (
+          id(dashboard_status).has_state() &&
+          !id(dashboard_status).state.empty()
+      ) {
+        status_text = id(dashboard_status).state;
+      }
+
+      // Center the title between the refresh indicator
+      // and the battery icon rather than across the full
+      // width, so its side gaps stay balanced
+      const Size refresh_icon_size =
+          measure_text(
+              it,
+              "\U000F0450",
+              id(font_mdi_small)
+          );
+
+      const Size refresh_text_size =
+          measure_text(
+              it,
+              last_refresh_time.c_str(),
+              id(Inter_medium)
+          );
+
+      const int refresh_width =
+          refresh_icon_size.width + 2 +
+          refresh_text_size.width;
+
+      const int battery_width =
+          battery_status_width(it);
+
+      const int title_left =
+          MARGIN + HEADER_INSET +
+          refresh_width + 12;
+
+      const int title_right =
+          W - MARGIN - HEADER_INSET -
+          battery_width - 12;
+
+      const int title_max_width =
+          title_right - title_left;
+
+      const std::string title =
+          fit_text(
+              it,
+              status_text,
+              id(Inter_medium),
+              title_max_width
+          );
+
+      it.print(
+          (title_left + title_right) / 2,
+          MARGIN + HEADER_HEIGHT / 2,
+          id(Inter_medium),
+          TextAlign::CENTER,
+          title.c_str()
+      );
+
+      draw_last_refresh(
+          it,
+          MARGIN + HEADER_INSET,
+          MARGIN,
+          HEADER_HEIGHT
+      );
+
+      // Battery level in the top right corner;
+      // hidden while at 100%
+      draw_battery_status(
+          it,
+          W - MARGIN - HEADER_INSET,
+          MARGIN,
+          HEADER_HEIGHT
+      );
+
+
+      // --------------------------------------------------
+      // Weather panel; the left column beside the
+      // calendar, or — when a refresh cycle produced no
+      // calendar content (all disabled, a quiet week, or
+      // the demo gap list naming calendars) — the full
+      // content width, aligned with the header box. The
+      // switch is runtime: every dashboard draw follows
+      // a completed fetch cycle or its watchdog, so an
+      // empty list at draw time is always a settled
+      // result, never a mid-fetch state. In the wide
+      // layout the current-weather group keeps a
+      // centered ~55% content width inside the box (its
+      // layout is right-anchored and would otherwise
+      // hug the screen edge), while the boundary and the
+      // hourly strip use the whole width — the strip's
+      // eight 2-hour slots instead of the four 3-hour
+      // ones that fit the column
+      // --------------------------------------------------
+
+      const bool show_calendar =
+          (${calendar_1_enabled} ||
+           ${calendar_2_enabled} ||
+           ${calendar_3_enabled} ||
+           ${calendar_4_enabled}) &&
+          !calendar_events.empty();
+
+      const int weather_width =
+          show_calendar
+              ? COLUMN_WIDTH
+              : W - 2 * MARGIN;
+
+      // Both layouts anchor at the left margin
+      const int weather_x = LEFT_X;
+
+      const int current_weather_width =
+          show_calendar
+              ? weather_width
+              : W * 55 / 100;
+
+      const int current_weather_x =
+          show_calendar
+              ? weather_x
+              : weather_x +
+                    (weather_width -
+                     current_weather_width) /
+                        2;
+
+      rounded_rectangle(
+          it,
+          weather_x,
+          CONTENT_Y,
+          weather_width,
+          CONTENT_HEIGHT,
+          CORNER_RADIUS
+      );
+
+      draw_current_weather(
+          it,
+          current_weather_x,
+          CONTENT_Y,
+          current_weather_width
+      );
+
+      constexpr int BOTTOM_INSET = 20;
+
+      draw_hourly_forecast(
+          it,
+          weather_x,
+          CONTENT_Y + CONTENT_HEIGHT - BOTTOM_INSET,
+          weather_width,
+          show_calendar
+              ? STRIP_GRID_COLUMN
+              : STRIP_GRID_FULL,
+          show_calendar
+              ? STRIP_GRID_COLUMN_COUNT
+              : STRIP_GRID_FULL_COUNT
+      );
+
+
+      // --------------------------------------------------
+      // Right panel - Calendar
+      // --------------------------------------------------
+
+      if (show_calendar) {
+        rounded_rectangle(
+            it,
+            RIGHT_X,
+            CONTENT_Y,
+            COLUMN_WIDTH,
+            CONTENT_HEIGHT,
+            CORNER_RADIUS
+        );
+
+        draw_calendar(
+            it,
+            RIGHT_X,
+            CONTENT_Y,
+            COLUMN_WIDTH,
+            CONTENT_HEIGHT
+        );
+      }

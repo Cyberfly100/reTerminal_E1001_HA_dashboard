@@ -155,6 +155,14 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # Join the saved network without scanning first — the
+  # scan costs 3-8 s on every boot, and on deep-sleep
+  # wake boots that sits squarely between the button
+  # press and the HA automation it fires. With several
+  # saved networks it picks the strongest instead of
+  # letting the scan decide; an unreachable AP still
+  # falls back to the hotspot below
+  fast_connect: true
   ap:
     ssid: reterminal_e100 Fallback Hotspot
     password: !secret reterminal_e1001_entrance__ap_password
@@ -753,10 +761,15 @@ script:
       # all calendar fetches append into a fresh list
       # regardless of the order in which their responses
       # arrive. The fetch window is precomputed here too,
-      # before the actions run
+      # before the actions run. The calendar layout
+      # bookkeeping (see calendar_helpers.h) resets with
+      # the list, before any calendar fetch can count
       - lambda: |-
           fetch_cycle_begin();
           calendar_events.clear();
+
+          calendar_fetches_dispatched = 0;
+          calendar_fetches_succeeded = 0;
 
           id(calendar_fetch_start) = calendar_window_start();
           id(calendar_fetch_end) = calendar_window_end();
@@ -795,6 +808,14 @@ script:
                 if (daily_uv_max < 0.0f) {
                   daily_uv_max = NAN;
                 }
+
+                ESP_LOGI(
+                    "fetch",
+                    "Daily forecast parsed: low %.0f, high %.0f, uv max %.0f",
+                    daily_low,
+                    daily_high,
+                    daily_uv_max
+                );
 
                 fetch_complete();
 
@@ -897,6 +918,14 @@ script:
                   forecast_slots.push_back(slot);
                 }
 
+                ESP_LOGI(
+                    "fetch",
+                    "Hourly forecast parsed: %d slots",
+                    static_cast<int>(
+                        forecast_slots.size()
+                    )
+                );
+
                 auto now = id(home_time).now();
 
                 if (now.is_valid()) {
@@ -929,7 +958,9 @@ script:
               condition:
                 lambda: 'return ${calendar_1_enabled};'
               then:
-              - lambda: 'fetch_begin();'
+              - lambda: |-
+                  fetch_begin();
+                  calendar_fetches_dispatched += 1;
               - homeassistant.action:
                   action: calendar.get_events
                   data:
@@ -968,6 +999,12 @@ script:
                             response["response"]["events"]
                         );
 
+                        // This fetch answered: settled
+                        // calendar data for the layout
+                        // switch — see
+                        // calendar_cycle_settled()
+                        calendar_fetches_succeeded += 1;
+
                         fetch_complete();
 
                   on_error:
@@ -981,7 +1018,9 @@ script:
               condition:
                 lambda: 'return ${calendar_2_enabled};'
               then:
-              - lambda: 'fetch_begin();'
+              - lambda: |-
+                  fetch_begin();
+                  calendar_fetches_dispatched += 1;
               - homeassistant.action:
                   action: calendar.get_events
                   data:
@@ -1015,6 +1054,12 @@ script:
                             response["response"]["events"]
                         );
 
+                        // This fetch answered: settled
+                        // calendar data for the layout
+                        // switch — see
+                        // calendar_cycle_settled()
+                        calendar_fetches_succeeded += 1;
+
                         fetch_complete();
 
                   on_error:
@@ -1028,7 +1073,9 @@ script:
               condition:
                 lambda: 'return ${calendar_3_enabled};'
               then:
-              - lambda: 'fetch_begin();'
+              - lambda: |-
+                  fetch_begin();
+                  calendar_fetches_dispatched += 1;
               - homeassistant.action:
                   action: calendar.get_events
                   data:
@@ -1062,6 +1109,12 @@ script:
                             response["response"]["events"]
                         );
 
+                        // This fetch answered: settled
+                        // calendar data for the layout
+                        // switch — see
+                        // calendar_cycle_settled()
+                        calendar_fetches_succeeded += 1;
+
                         fetch_complete();
 
                   on_error:
@@ -1075,7 +1128,9 @@ script:
               condition:
                 lambda: 'return ${calendar_4_enabled};'
               then:
-              - lambda: 'fetch_begin();'
+              - lambda: |-
+                  fetch_begin();
+                  calendar_fetches_dispatched += 1;
               - homeassistant.action:
                   action: calendar.get_events
                   data:
@@ -1109,6 +1164,12 @@ script:
                             response["response"]["events"]
                         );
 
+                        // This fetch answered: settled
+                        // calendar data for the layout
+                        // switch — see
+                        // calendar_cycle_settled()
+                        calendar_fetches_succeeded += 1;
+
                         fetch_complete();
 
                   on_error:
@@ -1128,6 +1189,16 @@ interval:
       - lambda: |-
           fetch_watchdog_tick();
           battery_saver_tick();
+
+  # Fast-path delivery of the wake-button replay: the
+  # same check the 5 s battery-saver tick does as a
+  # backstop, at 500 ms granularity, so a press that
+  # woke the device reaches its HA automation ~2 s
+  # after the state pushes arrive instead of up to 7 —
+  # see wake_replay_fast_tick() in sleep_helpers.h
+  - interval: 500ms
+    then:
+      - lambda: 'wake_replay_fast_tick();'
 
   # Regular refresh cycle. ESPHome's scheduler fires an
   # interval's FIRST execution immediately after setup
@@ -1304,21 +1375,25 @@ display:
 
       // --------------------------------------------------
       // Weather panel; the left column beside the
-      // calendar, or — when a refresh cycle produced no
-      // calendar content (all disabled, a quiet week, or
-      // the demo gap list naming calendars) — the full
-      // content width, aligned with the header box. The
-      // switch is runtime: every dashboard draw follows
-      // a completed fetch cycle or its watchdog, so an
-      // empty list at draw time is always a settled
-      // result, never a mid-fetch state. In the wide
-      // layout the current-weather group keeps a
-      // centered ~55% content width inside the box (its
-      // layout is right-anchored and would otherwise
-      // hug the screen edge), while the boundary and the
-      // hourly strip use the whole width — the strip's
-      // eight 2-hour slots instead of the four 3-hour
-      // ones that fit the column
+      // calendar, or — when a refresh cycle settled with
+      // no calendar content (all calendars disabled, or
+      // every enabled one answering with zero events —
+      // a genuinely quiet week) — the full content
+      // width, aligned with the header box. The switch
+      // is runtime but only for settled cycles: a
+      // failed, errored or still-in-flight calendar
+      // fetch keeps the split layout (an empty calendar
+      // panel) instead of surprise-removing it, so
+      // transient hiccups like the first cycle after an
+      // OTA flash do not flip the whole layout — see
+      // calendar_cycle_settled(). In the wide layout the
+      // current-weather group keeps a centered ~55%
+      // content width inside the box (its layout is
+      // right-anchored and would otherwise hug the
+      // screen edge), while the boundary and the hourly
+      // strip use the whole width — the strip's eight
+      // 2-hour slots instead of the four 3-hour ones
+      // that fit the column
       // --------------------------------------------------
 
       const bool show_calendar =
@@ -1326,7 +1401,20 @@ display:
            ${calendar_2_enabled} ||
            ${calendar_3_enabled} ||
            ${calendar_4_enabled}) &&
-          !calendar_events.empty();
+          (!calendar_cycle_settled() ||
+           !calendar_events.empty());
+
+      // One line per redraw summarizing the frame's data
+      // state — the diagnostics that would have told the
+      // story of a sparse first refresh after OTA (which
+      // fetch path delivered what)
+      ESP_LOGI(
+          "display",
+          "Redraw: %s layout, %d slots, %d events",
+          show_calendar ? "split" : "wide",
+          static_cast<int>(forecast_slots.size()),
+          static_cast<int>(calendar_events.size())
+      );
 
       const int weather_width =
           show_calendar
