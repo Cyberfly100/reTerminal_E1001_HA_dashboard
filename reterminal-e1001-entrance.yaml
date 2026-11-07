@@ -148,6 +148,15 @@ logger:
   # output onto the I2C pins and leaves the USB port
   # silent; UART0 puts the logs on the bridge
   hardware_uart: UART0
+  # INFO as the default: all of this project's own
+  # diagnostics (fetch parses, the redraw summary, the
+  # HA-timing applies) and the sensor publishes are
+  # INFO/WARN, so nothing documented is lost — but
+  # ESPHome's chatty per-message DEBUG lines (Got state,
+  # connection dumps) drop out of attached sessions.
+  # Flip to DEBUG when deep debugging (e.g. chasing a
+  # sparse-frame recurrence)
+  level: INFO
 
 api:
   encryption:
