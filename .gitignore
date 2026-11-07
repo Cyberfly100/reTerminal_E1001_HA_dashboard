@@ -20,3 +20,7 @@ build/
 # Local Python environments if esphome is run from here
 .venv/
 __pycache__/
+
+demo-*.yaml
+# Stray build logs
+*.log
