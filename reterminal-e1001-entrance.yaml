@@ -605,11 +605,15 @@ sensor:
     attenuation: 12db
     filters:
       - multiply: 2.0
-      # Drop impossible readings (unsettled measurement
-      # bridge after power-on reads ~0 V): a running 1S
-      # LiPo can never be below 2.5 V. Applies to the
-      # compensated value, hence after multiply
-      - lambda: 'if (x < 2.5f) return {}; return x;'
+      # Drop impossible readings: an unsettled
+      # measurement bridge after power-on can read ~0 V
+      # — or spike high. A running 1S LiPo sits between
+      # 2.5 V and ~4.25 V; anything outside cannot be a
+      # real pack voltage, and a garbage-high sample
+      # would otherwise clamp to a phantom 100 % (and
+      # hide the battery row at a real ~65 %). Applies
+      # to the compensated value, hence after multiply
+      - lambda: 'if (x < 2.5f || x > 4.3f) return {}; return x;'
     # Recompute the percentage right after every
     # voltage publish, so level and voltage can never
     # disagree (one stale garbage sample used to show
@@ -776,6 +780,23 @@ time:
 script:
   - id: refresh_dashboard
     then:
+      # A fresh battery reading for the frame about to be
+      # drawn. Each battery wake is shorter than the
+      # ADC's 60 s interval, so its only natural reading
+      # is the scheduler's immediate first execution
+      # (~5 s after boot) — exactly the one the <2.5 V
+      # drop-filter exists for: an unsettled bridge
+      # reads ~0 V, the sample is dropped, and the wake
+      # has no level at all (observed as an intermittently
+      # absent battery row on multi-day battery runs).
+      # Forcing a read here — past the bridge's settle
+      # time — gives the draw a real value on both the
+      # demo and the production path; the ADC's on_value
+      # then recomputes the level. A dropped forced read
+      # changes nothing (no publish, previous state
+      # stands)
+      - component.update: battery_voltage
+
       # Demo mode: canned data instead of the Home
       # Assistant fetches, so the layout can be tried
       # with no HA wiring at all (docs/testing.md); the
