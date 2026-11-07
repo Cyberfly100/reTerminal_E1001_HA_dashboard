@@ -75,11 +75,56 @@ Zephyr board support files.
 - **Battery bridge off before sleep** — GPIO21 (measurement divider
   enable) is turned off explicitly, so it cannot drain during sleep;
   verified further by a current measurement (below).
+- **Runtime-settable timings** — the sleep cycle and the
+  timer-wake window can be changed from Home Assistant without
+  reflashing, via two optional `input_number` helpers
+  (substitutions `sleep_seconds_entity` /
+  `awake_seconds_entity`, defaults
+  `input_number.e1001_sleep_seconds` /
+  `input_number.e1001_awake_seconds`):
+
+  ```yaml
+  input_number:
+    e1001_sleep_seconds:
+      name: E1001 sleep cycle
+      min: 300
+      max: 86400
+      step: 60
+      unit_of_measurement: s
+      icon: mdi:sleep
+      initial: 900
+    e1001_awake_seconds:
+      name: E1001 awake window
+      min: 10
+      max: 600
+      step: 5
+      unit_of_measurement: s
+      icon: mdi:eye
+      initial: 30
+  ```
+
+  The values are HA-owned by design: automations may set the
+  helpers while the device is asleep (a device-owned entity
+  would fail silently then), and the values land at the next
+  wake, where the states arrive with HA's initial push and are
+  clamped into the battery globals (`apply_sleep_seconds` /
+  `apply_awake_seconds` in sleep_helpers.h: 300–86400 s and
+  10–600 s — the device clamps, it does not trust the helper).
+  A change logs one line; re-arriving states are silent. Until
+  a helper exists or answers, the substitution defaults stand.
+  The wake-window anchor may arm before the states land (push
+  order is HA's); the new value applies from the next wake —
+  accepted by design. The button-wake window stays
+  compile-time (it doubles as the OTA/logs hatch), as do the
+  replay grace, fetch watchdog and connect ceiling — safety
+  machinery, not preferences.
 
 Substitutions: `battery_saver` (default `'true'` — on external
 power the saver stays completely inert), `battery_sleep_seconds`
 (`'900'`), `battery_awake_seconds` (`'30'`),
-`battery_button_awake_seconds` (`'120'`).
+`battery_button_awake_seconds` (`'120'`) — of these, the first
+two are runtime-overridable from HA (see the runtime-settable
+timings bullet above).
 
 ## Known constraints (unchanged from draft)
 

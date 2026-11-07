@@ -62,6 +62,18 @@ substitutions:
   # at the next wake
   keep_awake_entity: input_boolean.e1001_keep_awake
 
+  # Optional Home Assistant input_number helpers that
+  # set the sleep cycle and the timer-wake window at
+  # runtime. HA-owned values, read at every wake (see
+  # sleep_helpers.h for the semantics and the allowed
+  # ranges; until a helper exists or answers, the
+  # battery_sleep_seconds / battery_awake_seconds
+  # substitutions above apply). Automations may set
+  # them while the device is asleep — values land at
+  # the next wake
+  sleep_seconds_entity: input_number.e1001_sleep_seconds
+  awake_seconds_entity: input_number.e1001_awake_seconds
+
   # Optional header status text; until it answers the
   # header shows its fallback text
   dashboard_status_entity: input_text.dashboard_status
@@ -650,6 +662,34 @@ sensor:
       - clamp:
           min_value: 0
           max_value: 100
+
+  # HA-owned runtime settings for the battery timings —
+  # the sleep cycle and the timer-wake window (see the
+  # sleep_seconds_entity / awake_seconds_entity
+  # substitutions). Their states arrive with HA's
+  # initial push of every wake and are clamped into the
+  # battery globals (apply_sleep_seconds /
+  # apply_awake_seconds in sleep_helpers.h). The anchor
+  # may arm the wake window before these states land
+  # (push order is HA's); the new value then applies
+  # from the next wake — accepted by design. Until the
+  # helpers exist or answer, nothing happens and the
+  # substitution defaults stand
+  - platform: homeassistant
+    id: sleep_seconds_ha
+    entity_id: ${sleep_seconds_entity}
+    internal: true
+    on_value:
+      then:
+        - lambda: 'apply_sleep_seconds(x);'
+
+  - platform: homeassistant
+    id: awake_seconds_ha
+    entity_id: ${awake_seconds_entity}
+    internal: true
+    on_value:
+      then:
+        - lambda: 'apply_awake_seconds(x);'
 
 text_sensor:
   # Wake diagnostics: how the current session woke

@@ -167,6 +167,102 @@ inline void arm_awake_window_for_wake() {
   }
 }
 
+// ==================================================
+// Runtime-settable battery timings
+// ==================================================
+
+// The sleep cycle and the timer-wake window can be set
+// at runtime from Home Assistant (input_number helpers,
+// read as homeassistant sensors in the YAML). The
+// values are HA-owned by design: automations may set
+// them while the device is asleep — a device-owned
+// entity would fail silently then — and they land at
+// the next wake, where the states arrive with HA's
+// initial push. Until a helper exists or answers, the
+// compile-time substitutions apply (missing helpers
+// degrade silently to them). The anchor may arm the
+// wake window before these states land (push order is
+// HA's); the new value then applies from the next wake
+// — accepted by design, harmless by nature
+//
+// Clamped here rather than trusting the helper: a sleep
+// cycle below the floor churns wakes and burns more
+// battery than the saver saves, and a timer window
+// below its floor cuts HA's own subscribe margin after
+// an automatic wake. The button-wake window and every
+// other timing stay compile-time: the interactive
+// window doubles as the OTA/logs hatch, and the replay
+// grace, fetch watchdog and connect ceiling are safety
+// machinery, not preferences
+constexpr int SLEEP_SECONDS_MIN = 300;
+constexpr int SLEEP_SECONDS_MAX = 86400;  // 24 h
+constexpr int AWAKE_SECONDS_MIN = 10;
+constexpr int AWAKE_SECONDS_MAX = 600;    // 10 min
+
+// Apply a Home Assistant value to the sleep-cycle
+// global; logged only on change, since the state
+// re-arrives with every wake's initial push
+inline void apply_sleep_seconds(float value) {
+  if (isnan(value)) {
+    return;
+  }
+
+  int clamped = static_cast<int>(value);
+
+  if (clamped < SLEEP_SECONDS_MIN) {
+    clamped = SLEEP_SECONDS_MIN;
+  }
+
+  if (clamped > SLEEP_SECONDS_MAX) {
+    clamped = SLEEP_SECONDS_MAX;
+  }
+
+  if (clamped != id(battery_sleep_seconds)) {
+    ESP_LOGI(
+        "sleep",
+        "Sleep cycle set from Home Assistant: %d s "
+        "(raw %.0f s, allowed %d-%d)",
+        clamped,
+        value,
+        SLEEP_SECONDS_MIN,
+        SLEEP_SECONDS_MAX
+    );
+
+    id(battery_sleep_seconds) = clamped;
+  }
+}
+
+// Same for the timer-wake window
+inline void apply_awake_seconds(float value) {
+  if (isnan(value)) {
+    return;
+  }
+
+  int clamped = static_cast<int>(value);
+
+  if (clamped < AWAKE_SECONDS_MIN) {
+    clamped = AWAKE_SECONDS_MIN;
+  }
+
+  if (clamped > AWAKE_SECONDS_MAX) {
+    clamped = AWAKE_SECONDS_MAX;
+  }
+
+  if (clamped != id(battery_awake_seconds)) {
+    ESP_LOGI(
+        "sleep",
+        "Timer-wake window set from Home Assistant: %d s "
+        "(raw %.0f s, allowed %d-%d)",
+        clamped,
+        value,
+        AWAKE_SECONDS_MIN,
+        AWAKE_SECONDS_MAX
+    );
+
+    id(battery_awake_seconds) = clamped;
+  }
+}
+
 // Deferred wake-button replay. The state pushes that
 // trigger the anchor arrive as api messages BEFORE
 // Home Assistant's device-entity subscription is
