@@ -132,6 +132,26 @@ inline std::vector<ForecastSlot> forecast_slots;
 // ("--:--" until then), set by fetch_hourly_forecast
 inline std::string last_refresh_time = "--:--";
 
+// Normalizes the zero bucket for temperature rendering:
+// a value that rounds to zero draws unsigned ("0°"), never
+// the "-0" printf produces for values in (-0.5, 0). The
+// artifact shows up around the freezing point, where the
+// provider serves tenths (met.no) and the °F conversion can
+// land at -0.0x. Values outside the [-0.5, 0.5) bucket pass
+// through untouched, so every other rendering (including
+// printf's .5 ties) stays pixel-identical. Formatting layer
+// only — the underlying values stay honest for the
+// feels-like math, the °F conversion and the exposed
+// sensors. Every temperature field renders integer
+// ("%.0f"); a future one-decimal field ("%.1f") would need
+// its bucket edge lowered to 0.05
+inline float display_temperature(float value) {
+  if (value >= -0.5f && value < 0.5f) {
+    return 0.0f;
+  }
+  return value;
+}
+
 // Records the refresh time with the date in the
 // same format as the calendar day headers,
 // e.g. "Tuesday, Oct 12, 14:32"
@@ -469,13 +489,13 @@ inline int draw_current_weather(
         temperature_text,
         sizeof(temperature_text),
         "%.0f°",
-        current_temperature
+        display_temperature(current_temperature)
     );
     snprintf(
         temperature_digits,
         sizeof(temperature_digits),
         "%.0f",
-        current_temperature
+        display_temperature(current_temperature)
     );
   }
 
@@ -719,7 +739,7 @@ inline int draw_current_weather(
         low_text,
         sizeof(low_text),
         "%.0f°",
-        daily_low
+        display_temperature(daily_low)
     );
   }
 
@@ -734,7 +754,7 @@ inline int draw_current_weather(
         high_text,
         sizeof(high_text),
         "%.0f°",
-        daily_high
+        display_temperature(daily_high)
     );
   }
 
@@ -836,7 +856,7 @@ inline int draw_current_weather(
         feels_text,
         sizeof(feels_text),
         "%.0f%s",
-        current_feels_like,
+        display_temperature(current_feels_like),
         temperature_unit_suffix()
     );
   }
@@ -1164,7 +1184,7 @@ inline void draw_hourly_forecast(
           temperature_text,
           sizeof(temperature_text),
           "%.0f%s",
-          slot.temperature,
+          display_temperature(slot.temperature),
           temperature_unit_suffix()
       );
     }
