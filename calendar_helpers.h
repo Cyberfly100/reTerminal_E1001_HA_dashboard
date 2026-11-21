@@ -12,10 +12,23 @@
 
 struct CalendarEvent {
   std::string date;        // "YYYY-MM-DD", local start date
+  // "YYYY-MM-DD", local end date of the source event:
+  // inclusive for timed events (the event runs to that
+  // moment), the exclusive iCalendar convention for
+  // all-day ones (a Fri-Sun all-day event carries
+  // Monday here). Equal to date for single-day events
+  std::string end_date;
   bool all_day;            // true for all-day events
   std::string start_time;  // "HH:MM", empty for all-day events
   std::string end_time;    // "HH:MM", empty for all-day events
   std::string summary;
+  // Span-rendering flags, set only on the per-day rows
+  // the render-time expansion produces (see
+  // expand_event_spans): the source event also covers
+  // the previous / next day. False on stored source
+  // events and on single-day rows
+  bool continues_before = false;
+  bool continues_after = false;
 };
 
 // Calendar events, filled by the calendar actions in
@@ -112,6 +125,15 @@ inline void parse_calendar_events(JsonArrayConst events) {
 
     event.date = start.substr(0, 10);
 
+    // End date of the source event — timed ends are
+    // inclusive, all-day ends follow the exclusive
+    // iCalendar convention (see CalendarEvent::end_date);
+    // an absent end collapses to a single-day event
+    event.end_date =
+        end.size() >= 10
+            ? end.substr(0, 10)
+            : event.date;
+
     event.all_day = start.size() <= 10;
 
     if (start.size() >= 16) {
@@ -143,6 +165,13 @@ inline void parse_calendar_events(JsonArrayConst events) {
 // Merged, deduplicated event list
 // ==================================================
 
+// Expands multi-day events into one row per covered day;
+// defined below, after the ISO day arithmetic it builds
+// on — the pipeline here only needs the signature
+inline std::vector<CalendarEvent> expand_event_spans(
+    const std::vector<CalendarEvent> &events
+);
+
 inline bool calendar_event_before(
     const CalendarEvent &a,
     const CalendarEvent &b
@@ -151,8 +180,17 @@ inline bool calendar_event_before(
     return a.date < b.date;
   }
 
-  if (a.all_day != b.all_day) {
-    return a.all_day;
+  // Within a day, day-spanning rows come first: all-day
+  // events and continuation rows — a span that is
+  // running is, for that day, effectively an all-day
+  // fact (see expand_event_spans)
+  const bool a_spans_day =
+      a.all_day || a.continues_before;
+  const bool b_spans_day =
+      b.all_day || b.continues_before;
+
+  if (a_spans_day != b_spans_day) {
+    return a_spans_day;
   }
 
   return a.start_time < b.start_time;
@@ -167,19 +205,43 @@ inline bool calendar_event_equal(
 ) {
   return (
       a.date == b.date &&
+      a.end_date == b.end_date &&
       a.all_day == b.all_day &&
       a.start_time == b.start_time &&
       a.end_time == b.end_time &&
-      a.summary == b.summary
+      a.summary == b.summary &&
+      a.continues_before == b.continues_before &&
+      a.continues_after == b.continues_after
   );
 }
 
-// Sorted copy of all fetched events with duplicates
-// removed; sorting and deduplication happen here at
-// draw time, independent of the order in which the
-// individual calendar responses arrive
+// Sorted, deduplicated list of the rows the panel
+// renders: the source events are deduplicated exactly,
+// then each event expands to one row per covered day
+// (see expand_event_spans) and the rows re-sort into
+// their days and deduplicate the same way. Sorting and
+// deduplication happen here at draw time, independent of
+// the order in which the individual calendar responses
+// arrive
 inline std::vector<CalendarEvent> unique_calendar_events() {
   std::vector<CalendarEvent> events = calendar_events;
+
+  std::sort(
+      events.begin(),
+      events.end(),
+      calendar_event_before
+  );
+
+  events.erase(
+      std::unique(
+          events.begin(),
+          events.end(),
+          calendar_event_equal
+      ),
+      events.end()
+  );
+
+  events = expand_event_spans(events);
 
   std::sort(
       events.begin(),
@@ -353,6 +415,195 @@ inline std::string calendar_window_end() {
       id(home_time).now().timestamp +
       14LL * 24 * 3600
   );
+}
+
+
+// ==================================================
+// Event span rendering
+// ==================================================
+
+// ISO day arithmetic ("YYYY-MM-DD"; lexicographic order
+// equals chronological order, so the span logic compares
+// dates as plain strings)
+inline int days_in_month(int year, int month) {
+  static const int lengths[12] = {
+      31, 28, 31, 30, 31, 30,
+      31, 31, 30, 31, 30, 31
+  };
+
+  if (month == 2 && is_leap_year(year)) {
+    return 29;
+  }
+
+  return lengths[month - 1];
+}
+
+inline std::string iso_date(
+    int year,
+    int month,
+    int day
+) {
+  // 16 bytes: the ISO form needs 11, but the compiler
+  // cannot prove %02d stays two digits and warns on the
+  // tighter buffer
+  char text[16];
+
+  snprintf(
+      text,
+      sizeof(text),
+      "%04d-%02d-%02d",
+      year,
+      month,
+      day
+  );
+
+  return text;
+}
+
+// The day after / before an ISO date; "" on a malformed
+// date, which the span iteration treats as "stop"
+inline std::string next_iso_date(
+    const std::string &date
+) {
+  int year;
+  int month;
+  int day;
+
+  if (
+      sscanf(
+          date.c_str(),
+          "%d-%d-%d",
+          &year,
+          &month,
+          &day
+      ) != 3
+  ) {
+    return "";
+  }
+
+  day++;
+
+  if (day > days_in_month(year, month)) {
+    day = 1;
+    month++;
+
+    if (month > 12) {
+      month = 1;
+      year++;
+    }
+  }
+
+  return iso_date(year, month, day);
+}
+
+inline std::string previous_iso_date(
+    const std::string &date
+) {
+  int year;
+  int month;
+  int day;
+
+  if (
+      sscanf(
+          date.c_str(),
+          "%d-%d-%d",
+          &year,
+          &month,
+          &day
+      ) != 3
+  ) {
+    return "";
+  }
+
+  day--;
+
+  if (day < 1) {
+    month--;
+
+    if (month < 1) {
+      month = 12;
+      year--;
+    }
+
+    day = days_in_month(year, month);
+  }
+
+  return iso_date(year, month, day);
+}
+
+// Today as an ISO date from the device clock; "" while
+// the clock is unsynced (the span clamp then degrades
+// to unclamped expansion — every fetched event already
+// implies a valid clock, this is belt-and-braces)
+inline std::string today_iso() {
+  const esphome::ESPTime now = id(home_time).now();
+
+  if (!now.is_valid()) {
+    return "";
+  }
+
+  return iso_date(
+      now.year,
+      now.month,
+      now.day_of_month
+  );
+}
+
+// One row per day an event covers: a multi-day event
+// renders under every day header it spans — its own
+// start time on the first day ("18:00 -"), its end time
+// on the last ("- 21:00"), a bare continuation dash in
+// between; all-day spans render like any all-day event,
+// no times. The first shown day is clamped to today: an
+// event already running when the fetch window opened
+// renders under today's header as a continuation instead
+// of under its past start date. The last covered day
+// follows the source's end-date convention — inclusive
+// for timed events, exclusive for all-day ones (see
+// CalendarEvent::end_date). The stored source events
+// are untouched: the span is a rendering concern, not
+// data
+inline std::vector<CalendarEvent> expand_event_spans(
+    const std::vector<CalendarEvent> &events
+) {
+  const std::string today = today_iso();
+
+  std::vector<CalendarEvent> rows;
+
+  for (const CalendarEvent &event : events) {
+    std::string last_day = event.end_date;
+
+    if (event.all_day) {
+      // Exclusive end: the last covered day is the day
+      // before the end date. A single-day all-day event
+      // carries start+1 here and collapses correctly;
+      // an absent end carried start itself, so clamp
+      last_day = previous_iso_date(last_day);
+
+      if (last_day < event.date) {
+        last_day = event.date;
+      }
+    }
+
+    std::string day =
+        (!today.empty() && event.date < today)
+            ? today
+            : event.date;
+
+    while (!day.empty() && day <= last_day) {
+      CalendarEvent row = event;
+
+      row.date = day;
+      row.continues_before = day > event.date;
+      row.continues_after = day < last_day;
+
+      rows.push_back(row);
+
+      day = next_iso_date(day);
+    }
+  }
+
+  return rows;
 }
 
 
@@ -547,7 +798,42 @@ inline void draw_calendar(
     if (timed) {
       char time_text[16];
 
-      if (event.start_time.empty()) {
+      // Span rows show only the edge their day owns (see
+      // expand_event_spans): the start time on the first
+      // covered day, the end time on the last, a bare
+      // dash in between. Single-day events (and rows a
+      // boundary time is missing from) fall through to
+      // the plain renderings below
+      if (
+          event.continues_before &&
+          event.continues_after
+      ) {
+        snprintf(
+            time_text,
+            sizeof(time_text),
+            "-"
+        );
+      } else if (
+          event.continues_after &&
+          !event.start_time.empty()
+      ) {
+        snprintf(
+            time_text,
+            sizeof(time_text),
+            "%s -",
+            event.start_time.c_str()
+        );
+      } else if (
+          event.continues_before &&
+          !event.end_time.empty()
+      ) {
+        snprintf(
+            time_text,
+            sizeof(time_text),
+            "- %s",
+            event.end_time.c_str()
+        );
+      } else if (event.start_time.empty()) {
         snprintf(
             time_text,
             sizeof(time_text),
